@@ -99,7 +99,6 @@ interface NewsInsight {
   supportResistance?: {
     analysis: string;
     stopLossDistance: string;
-    positionSize: string;
   };
   keyDrivers: string[];
 }
@@ -163,8 +162,11 @@ interface StockData {
     score: number;
     action: 'Buy' | 'Sell' | 'Neutral';
   };
+  buyScore?: number;
+  sellScore?: number;
   qualityScore?: number;
   valueScore?: number;
+  crashSimilarityScore?: number;
   supportLevel: number;
   resistanceLevel: number;
   historicalHigh: number;
@@ -211,14 +213,34 @@ interface ScreenerItem {
   price: number;
   sector: string;
   changePercent?: number;
+  aiScore?: number;
   buyScore?: number;
   sellScore?: number;
   qualityScore?: number;
   valueScore?: number;
+  crashSimilarityScore?: number;
   ecmStatus?: string;
 }
 
 // --- Helper Functions ---
+
+const getPosScore = (item: any) => {
+  const calc = (score: number) => score > 5 ? score - 5 : 0;
+  const ai = Number(item?.aiScore ?? item?.screenerRating?.score) || 5;
+  const qual = Number(item?.qualityScore) || 5;
+  const val = Number(item?.valueScore) || 5;
+  const buy = Number(item?.buyScore) || 0;
+  return calc(ai) + calc(qual) + calc(val) + buy;
+};
+
+const getNegScore = (item: any) => {
+  const calc = (score: number) => score < 5 ? 5 - score : 0;
+  const ai = Number(item?.aiScore ?? item?.screenerRating?.score) || 5;
+  const qual = Number(item?.qualityScore) || 5;
+  const val = Number(item?.valueScore) || 5;
+  const sell = Number(item?.sellScore) || 0;
+  return calc(ai) + calc(qual) + calc(val) + sell;
+};
 
 const safeParseJson = (text: string) => {
   let cleaned = text.replace(/```json/g, '').replace(/```/g, '').trim();
@@ -252,8 +274,9 @@ const safeParseJson = (text: string) => {
 
 // --- Components ---
 
-const ScoreCircle = ({ score, total = 10, type = 'buy' }: { score: number, total?: number, type: 'buy' | 'sell' | 'quality' | 'value' }) => {
-  const percentage = (score / total) * 100;
+const ScoreCircle = ({ score, total = 10, type = 'buy' }: { score: number, total?: number, type: 'buy' | 'sell' | 'quality' | 'value' | 'crashSim' | 'ai' }) => {
+  const safeScore = Number(score) || 0;
+  const percentage = (safeScore / total) * 100;
   
   let color = '#10b981';
   let bgColor = 'rgba(16, 185, 129, 0.1)';
@@ -266,6 +289,12 @@ const ScoreCircle = ({ score, total = 10, type = 'buy' }: { score: number, total
   } else if (type === 'value') {
     color = '#a855f7';
     bgColor = 'rgba(168, 85, 247, 0.1)';
+  } else if (type === 'crashSim') {
+    color = '#f59e0b'; // amber-500
+    bgColor = 'rgba(245, 158, 11, 0.1)';
+  } else if (type === 'ai') {
+    color = '#0ea5e9'; // sky-500
+    bgColor = 'rgba(14, 165, 233, 0.1)';
   }
 
   const offset = 100 - percentage;
@@ -297,7 +326,7 @@ const BuffettIndicator = () => {
     if (data) return;
     setLoading(true);
     try {
-      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
       const prompt = `Find the LATEST Buffett Indicator (Market Cap to GDP ratio) for the US market from https://www.longtermtrends.com/market-cap-to-gdp-the-buffett-indicator/. 
       Get current % ratio, a status label (e.g. "Value", "Overvalued"), and a brief 1-sentence context. 
       Also provide 10 historical values to form a sparkline.
@@ -444,7 +473,7 @@ const VixIndicator = () => {
           tools: [{ googleSearch: {} }]
         }
       });
-      const d = safeParseJson(r.candidates?.[0]?.content?.parts?.[0]?.text || '{}');
+      const d = safeParseJson(r.text || '{}');
       setData(d);
     } catch (e) { console.error(e); } finally { setLoading(false); }
   };
@@ -747,9 +776,9 @@ export const CycleChart = ({ anchorDate, events }: { anchorDate: string, events:
                if (x < 0 || x > baseWidth) return null;
                
                const isMajor = ev.type === 'Major';
-               const isGreen = ev.label.includes('亞洲') || ev.label.includes('綠') || ev.label.includes('特別大') || ev.label.includes('D23'); 
-               const isPinkBanner = ev.label.includes('頂峰') || ev.label.includes('高點') || ev.label.includes('8.6') || ev.label.includes('大週期') || ev.label.includes('ECM 週期性');
-               const isRed = isMajor || ev.label.includes('ECM') || ev.label.includes('轉折') || ev.label.includes('Q2');
+               const isGreen = ev.label?.includes('亞洲') || ev.label?.includes('綠') || ev.label?.includes('特別大') || ev.label?.includes('D23'); 
+               const isPinkBanner = ev.label?.includes('頂峰') || ev.label?.includes('高點') || ev.label?.includes('8.6') || ev.label?.includes('大週期') || ev.label?.includes('ECM 週期性');
+               const isRed = isMajor || ev.label?.includes('ECM') || ev.label?.includes('轉折') || ev.label?.includes('Q2');
                const pillColor = isGreen ? "#10B981" : isRed ? "#F43F5E" : "#FACC15";
                
                // Precise Y on Wave
@@ -766,11 +795,11 @@ export const CycleChart = ({ anchorDate, events }: { anchorDate: string, events:
                // Horizontal shift for long banners that might be near the edge
                let shiftX = 0;
                if (isPinkBanner) {
-                 const bannerHalfWidth = (ev.label.length * 16 + 60) / 2;
+                 const bannerHalfWidth = ((ev.label?.length || 0) * 16 + 60) / 2;
                  if (x - bannerHalfWidth < 20) shiftX = bannerHalfWidth - x + 20;
                  if (x + bannerHalfWidth > baseWidth - 20) shiftX = baseWidth - 20 - (x + bannerHalfWidth);
                } else {
-                 const pillHalfWidth = (ev.label.length * 16 + 40) / 2;
+                 const pillHalfWidth = ((ev.label?.length || 0) * 16 + 40) / 2;
                  if (x - pillHalfWidth < 20) shiftX = pillHalfWidth - x + 20;
                  if (x + pillHalfWidth > baseWidth - 20) shiftX = baseWidth - 20 - (x + pillHalfWidth);
                }
@@ -791,13 +820,13 @@ export const CycleChart = ({ anchorDate, events }: { anchorDate: string, events:
                        {isPinkBanner ? (
                          // Special Banner Style
                          <>
-                           <rect x={-(ev.label.length * 8 + 30)} y="-22" width={ev.label.length * 16 + 60} height="44" rx="10" fill="rgba(244, 63, 94, 0.2)" stroke="#F43F5E" strokeWidth="2" className="backdrop-blur-md" />
+                           <rect x={-((ev.label?.length || 0) * 8 + 30)} y="-22" width={(ev.label?.length || 0) * 16 + 60} height="44" rx="10" fill="rgba(244, 63, 94, 0.2)" stroke="#F43F5E" strokeWidth="2" className="backdrop-blur-md" />
                            <text x="0" y="6" fill="#FDA4AF" fontSize="18" fontWeight="900" textAnchor="middle" filter="drop-shadow(0px 2px 4px rgba(0,0,0,0.8))">{ev.label}</text>
                          </>
                        ) : (
                          // Standard Pill Style
                          <>
-                           <rect x={-(ev.label.length * 8 + 20)} y="-18" width={ev.label.length * 16 + 40} height="36" rx="18" fill={pillColor} fillOpacity="0.2" stroke={pillColor} strokeWidth="1.5" className="backdrop-blur-md" />
+                           <rect x={-((ev.label?.length || 0) * 8 + 20)} y="-18" width={(ev.label?.length || 0) * 16 + 40} height="36" rx="18" fill={pillColor} fillOpacity="0.2" stroke={pillColor} strokeWidth="1.5" className="backdrop-blur-md" />
                            <text x="0" y="6" fill={pillColor} fontSize="16" fontWeight="900" textAnchor="middle" filter="drop-shadow(0px 2px 4px rgba(0,0,0,0.8))">{ev.label}</text>
                          </>
                        )}
@@ -864,7 +893,11 @@ const DrawdownChart = ({ drawdowns }: { drawdowns: DrawdownEvent[] }) => {
     </div>
   );
 
-  const sortedDrawdowns = [...drawdowns].sort((a, b) => new Date(a.highDate).getTime() - new Date(b.highDate).getTime());
+  const sortedDrawdowns = [...drawdowns].sort((a, b) => {
+    const aTime = a.highDate ? new Date(a.highDate).getTime() : 0;
+    const bTime = b.highDate ? new Date(b.highDate).getTime() : 0;
+    return (isNaN(aTime) ? 0 : aTime) - (isNaN(bTime) ? 0 : bTime);
+  });
   
   const width = 800;
   const height = 300;
@@ -986,7 +1019,11 @@ const HistoricalDrawdownView = ({ data }: { data: StockData }) => {
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-700/50">
-              {(data.historicalDrawdowns || []).map((item, idx) => (
+              {([...(data.historicalDrawdowns || [])].filter((d): d is DrawdownEvent => !!d).sort((a, b) => {
+                const aTime = a.highDate ? new Date(a.highDate).getTime() : 0;
+                const bTime = b.highDate ? new Date(b.highDate).getTime() : 0;
+                return (isNaN(bTime) ? 0 : bTime) - (isNaN(aTime) ? 0 : aTime);
+              })).map((item, idx) => (
                 <tr key={idx} className="hover:bg-slate-700/30 transition-colors group">
                   <td className="p-4">
                     <div className="font-bold text-emerald-400">{item.highDate}</div>
@@ -1017,14 +1054,17 @@ const PriceScreener = () => {
   const [minPrice, setMinPrice] = useState('10');
   const [maxPrice, setMaxPrice] = useState('50');
   const [minScore, setMinScore] = useState('6');
+  const [minBuyScore, setMinBuyScore] = useState('6');
+  const [minSellScore, setMinSellScore] = useState('0');
   const [minQualityScore, setMinQualityScore] = useState('6');
   const [minValueScore, setMinValueScore] = useState('6');
+  const [minCrashSimScore, setMinCrashSimScore] = useState('1');
   const [limit, setLimit] = useState('50');
-  const [screenMode, setScreenMode] = useState<'custom' | 'top10' | 'bottom10'>('custom');
+  const [screenMode, setScreenMode] = useState<'custom' | 'top50' | 'bottom50'>('custom');
   const [results, setResults] = useState<ScreenerItem[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
-  const [sortBy, setSortBy] = useState<'default' | 'buy' | 'sell'>('default');
+  const [sortBy, setSortBy] = useState<'default' | 'buy' | 'sell' | 'quality' | 'value' | 'crashSim' | 'pos' | 'neg'>('default');
 
   const handleExportJson = () => {
     if (results.length === 0) return;
@@ -1038,7 +1078,7 @@ const PriceScreener = () => {
     linkElement.click();
   };
 
-  const handleSearch = async (mode: 'custom' | 'top10' | 'bottom10' = 'custom') => {
+  const handleSearch = async (mode: 'custom' | 'top50' | 'bottom50' = 'custom') => {
     if (mode === 'custom' && (!minPrice || !maxPrice)) {
       setError('請輸入價格範圍');
       return;
@@ -1049,24 +1089,24 @@ const PriceScreener = () => {
     setResults([]);
     
     try {
-      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
       let prompt = '';
 
-      if (mode === 'top10') {
-        prompt = `Using real-time market data from Yahoo Finance and Martin Armstrong's Socrates ECM model principles, find the TOP 10 best performing US Stocks right now. 
+      if (mode === 'top50') {
+        prompt = `Using real-time market data from Yahoo Finance and Martin Armstrong's Socrates ECM model principles, find the TOP 50 best performing US Stocks right now. 
         Focus on assets showing strong bullish technical reversals, proximity to positive cycle turning points, or high "buyScores" in the Socrates model.`;
-      } else if (mode === 'bottom10') {
-        prompt = `Using real-time market data from Yahoo Finance and Martin Armstrong's Socrates ECM model principles, find the TOP 10 worst performing US Stocks right now. 
+      } else if (mode === 'bottom50') {
+        prompt = `Using real-time market data from Yahoo Finance and Martin Armstrong's Socrates ECM model principles, find the TOP 50 worst performing US Stocks right now. 
         Focus on assets showing deep bearish trends, proximity to negative cycle peaks, or high "sellScores" (overbought/danger) in the Socrates model.`;
       } else {
         prompt = `Find approximately ${limit} US Stocks that are currently trading between $${minPrice} and $${maxPrice} USD using Yahoo Finance data.
-        IMPORTANT: Only include assets that you estimate would have a Socrates ECM "buyScore" (1-10) of AT LEAST ${minScore}/10 right now, a Quality Score of AT LEAST ${minQualityScore}/10, and a Value Score of AT LEAST ${minValueScore}/10.`;
+        IMPORTANT: Only include assets that you estimate would have a Screener AI Score (1-10) of AT LEAST ${minScore}/10 right now, a Socrates ECM "buyScore" (1-10) of AT LEAST ${minBuyScore}/10 right now, a "sellScore" (1-10) of AT LEAST ${minSellScore}/10, a Quality Score of AT LEAST ${minQualityScore}/10, a Value Score of AT LEAST ${minValueScore}/10, and a Crash Similarity Score of AT LEAST ${minCrashSimScore}/10.`;
       }
 
       prompt += `
       Use Google Search to fetch the MOST RECENT and EXACT price for EACH of the selected assets on Yahoo Finance today. Do not hallucinate or use outdated prices.
 
-      CRITICAL INSTRUCTION: For EACH resulting asset, you MUST estimate a "buyScore" (1-10) and "sellScore" (1-10) based on Martin Armstrong's ECM model principles (e.g., proximity to cycle lows/highs, recent trends). Also provide a brief "ecmStatus" indicating the current status. Include "qualityScore" (1-10) and "valueScore" (1-10).
+      CRITICAL INSTRUCTION: For EACH resulting asset, you MUST estimate a "buyScore" (1-10) and "sellScore" (1-10) based on Martin Armstrong's ECM model principles (e.g., proximity to cycle lows/highs, recent trends). Also provide a brief "ecmStatus" indicating the current status. Include "aiScore" (1-10) as a general AI rating, "qualityScore" (1-10) and "valueScore" (1-10). Additionally, include a "crashSimilarityScore" (1-10) evaluating the similarity between the recent drawdown and the 2 most recent major historical drawdowns over the past 5 years.
       IMPORTANT: The "ecmStatus" field MUST be written in Traditional Chinese (繁體中文), e.g., "接近週期低點", "超買", "中性發展".
       
       Return the response strictly as a JSON array of objects with the following structure:
@@ -1076,10 +1116,12 @@ const PriceScreener = () => {
           "name": "Apple Inc.", 
           "price": 150.00, 
           "sector": "Technology",
+          "aiScore": 8,
           "buyScore": 8,
           "sellScore": 2,
           "qualityScore": 8,
           "valueScore": 7,
+          "crashSimilarityScore": 5,
           "ecmStatus": "接近潛在週期底部"
         },
         ...
@@ -1117,6 +1159,7 @@ const PriceScreener = () => {
             
             const priceData = safeParseJson(priceResponse.text || '{}');
             data = data.map((item: any) => {
+              if (!item.symbol) return item;
               const latestPrice = priceData[item.symbol.toUpperCase()];
               if (latestPrice && !isNaN(Number(latestPrice))) {
                 item.price = Number(latestPrice);
@@ -1147,6 +1190,21 @@ const PriceScreener = () => {
     if (sortBy === 'sell') {
       return items.sort((a, b) => (b.sellScore || 0) - (a.sellScore || 0));
     }
+    if (sortBy === 'quality') {
+      return items.sort((a, b) => (b.qualityScore || 0) - (a.qualityScore || 0));
+    }
+    if (sortBy === 'value') {
+      return items.sort((a, b) => (b.valueScore || 0) - (a.valueScore || 0));
+    }
+    if (sortBy === 'crashSim') {
+      return items.sort((a, b) => (b.crashSimilarityScore || 0) - (a.crashSimilarityScore || 0));
+    }
+    if (sortBy === 'pos') {
+      return items.sort((a, b) => getPosScore(b) - getPosScore(a));
+    }
+    if (sortBy === 'neg') {
+      return items.sort((a, b) => getNegScore(b) - getNegScore(a));
+    }
     return items;
   }, [results, sortBy]);
 
@@ -1160,22 +1218,22 @@ const PriceScreener = () => {
           </h3>
           <div className="flex gap-2">
             <button 
-              onClick={() => handleSearch('top10')}
+              onClick={() => handleSearch('top50')}
               disabled={loading}
               className={`px-4 py-2 rounded-xl text-xs font-black transition-all border flex items-center gap-2 ${
-                screenMode === 'top10' ? 'bg-emerald-600 border-emerald-400 text-white' : 'bg-slate-900 border-slate-700 text-emerald-500 hover:border-emerald-500'
+                screenMode === 'top50' ? 'bg-emerald-600 border-emerald-400 text-white' : 'bg-slate-900 border-slate-700 text-emerald-500 hover:border-emerald-500'
               }`}
             >
-              <TrendingUpIcon className="w-4 h-4" /> 最強前 10 名
+              <TrendingUpIcon className="w-4 h-4" /> 最強前 50 名
             </button>
             <button 
-              onClick={() => handleSearch('bottom10')}
+              onClick={() => handleSearch('bottom50')}
               disabled={loading}
               className={`px-4 py-2 rounded-xl text-xs font-black transition-all border flex items-center gap-2 ${
-                screenMode === 'bottom10' ? 'bg-red-600 border-red-400 text-white' : 'bg-slate-900 border-slate-700 text-red-500 hover:border-red-500'
+                screenMode === 'bottom50' ? 'bg-red-600 border-red-400 text-white' : 'bg-slate-900 border-slate-700 text-red-500 hover:border-red-500'
               }`}
             >
-              <TrendingDownIcon className="w-4 h-4" /> 最弱前 10 名
+              <TrendingDownIcon className="w-4 h-4" /> 最弱前 50 名
             </button>
             <button 
               onClick={() => setScreenMode('custom')}
@@ -1189,7 +1247,7 @@ const PriceScreener = () => {
         </div>
         
         {screenMode === 'custom' ? (
-          <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-7 gap-4 items-end animate-in fade-in slide-in-from-top-2 duration-300">
+          <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-4 items-end animate-in fade-in slide-in-from-top-2 duration-300">
             <div>
               <label className="block text-xs font-bold text-slate-500 mb-2 uppercase">價格 (起)</label>
               <div className="relative">
@@ -1217,13 +1275,39 @@ const PriceScreener = () => {
             </div>
 
             <div>
-              <label className="block text-xs font-bold text-slate-500 mb-2 uppercase" title="Minimum Buy Score">最低 AI 分</label>
+              <label className="block text-xs font-bold text-sky-500/80 mb-2 uppercase" title="Minimum AI Score">最低 AI 分</label>
               <select 
                 value={minScore} 
                 onChange={e => setMinScore(e.target.value)}
-                className="w-full bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-sm text-white font-bold outline-none focus:border-amber-500"
+                className="w-full bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-sm text-white font-bold outline-none focus:border-sky-500"
               >
                 {[1, 2, 3, 4, 5, 6, 7, 8, 9].map(num => (
+                  <option key={num} value={num.toString()}>{num}+</option>
+                ))}
+              </select>
+            </div>
+
+            <div>
+              <label className="block text-xs font-bold text-emerald-500/80 mb-2 uppercase" title="Minimum Buy Score">最低 Buy Score</label>
+              <select 
+                value={minBuyScore} 
+                onChange={e => setMinBuyScore(e.target.value)}
+                className="w-full bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-sm text-white font-bold outline-none focus:border-emerald-500"
+              >
+                {[0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map(num => (
+                  <option key={num} value={num.toString()}>{num}+</option>
+                ))}
+              </select>
+            </div>
+
+            <div>
+              <label className="block text-xs font-bold text-rose-500/80 mb-2 uppercase" title="Minimum Sell Score">最低 Sell Score</label>
+              <select 
+                value={minSellScore} 
+                onChange={e => setMinSellScore(e.target.value)}
+                className="w-full bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-sm text-white font-bold outline-none focus:border-rose-500"
+              >
+                {[0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map(num => (
                   <option key={num} value={num.toString()}>{num}+</option>
                 ))}
               </select>
@@ -1248,6 +1332,19 @@ const PriceScreener = () => {
                 value={minValueScore} 
                 onChange={e => setMinValueScore(e.target.value)}
                 className="w-full bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-sm text-white font-bold outline-none focus:border-purple-500"
+              >
+                {[1, 2, 3, 4, 5, 6, 7, 8, 9].map(num => (
+                  <option key={num} value={num.toString()}>{num}+</option>
+                ))}
+              </select>
+            </div>
+
+            <div>
+              <label className="block text-xs font-bold text-amber-500/80 mb-2 uppercase whitespace-nowrap">崩盤相似度 (低-高)</label>
+              <select 
+                value={minCrashSimScore} 
+                onChange={e => setMinCrashSimScore(e.target.value)}
+                className="w-full bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-sm text-white font-bold outline-none focus:border-amber-500"
               >
                 {[1, 2, 3, 4, 5, 6, 7, 8, 9].map(num => (
                   <option key={num} value={num.toString()}>{num}+</option>
@@ -1281,7 +1378,7 @@ const PriceScreener = () => {
         ) : (
           <div className="bg-slate-900/50 p-4 rounded-2xl border border-slate-700/50 text-center animate-in zoom-in-95 duration-300">
              <p className="text-slate-400 font-medium">
-               正在透過 Socrates ECM 模型分析市場中的 {screenMode === 'top10' ? '最佳' : '最差'} 10 名表現者...
+               正在透過 Socrates ECM 模型分析市場中的 {screenMode === 'top50' ? '最佳' : '最差'} 50 名表現者...
              </p>
           </div>
         )}
@@ -1309,24 +1406,54 @@ const PriceScreener = () => {
                   匯出 JSON
                 </button>
               </div>
-              <div className="flex bg-slate-800 p-1 rounded-lg border border-slate-700">
+              <div className="flex bg-slate-800 p-1 rounded-lg border border-slate-700 overflow-x-auto custom-scrollbar whitespace-nowrap">
                 <button 
                   onClick={() => setSortBy('default')}
-                  className={`px-3 py-1.5 text-xs font-bold rounded-md transition-all ${sortBy === 'default' ? 'bg-slate-700 text-white shadow-sm' : 'text-slate-500 hover:text-slate-300'}`}
+                  className={`px-3 py-1.5 text-xs font-bold rounded-md transition-all shrink-0 ${sortBy === 'default' ? 'bg-slate-700 text-white shadow-sm' : 'text-slate-500 hover:text-slate-300'}`}
                 >
                   默認排序
                 </button>
                 <button 
+                  onClick={() => setSortBy('pos')}
+                  className={`px-3 py-1.5 text-xs font-bold rounded-md transition-all shrink-0 ${sortBy === 'pos' ? 'bg-emerald-600 text-white shadow-sm' : 'text-slate-500 hover:text-emerald-400'}`}
+                >
+                  Pos 值 (高→低)
+                </button>
+                <button 
+                  onClick={() => setSortBy('neg')}
+                  className={`px-3 py-1.5 text-xs font-bold rounded-md transition-all shrink-0 ${sortBy === 'neg' ? 'bg-rose-600 text-white shadow-sm' : 'text-slate-500 hover:text-rose-400'}`}
+                >
+                  Neg 值 (高→低)
+                </button>
+                <button 
                   onClick={() => setSortBy('buy')}
-                  className={`px-3 py-1.5 text-xs font-bold rounded-md transition-all ${sortBy === 'buy' ? 'bg-emerald-600 text-white shadow-sm' : 'text-slate-500 hover:text-emerald-400'}`}
+                  className={`px-3 py-1.5 text-xs font-bold rounded-md transition-all shrink-0 ${sortBy === 'buy' ? 'bg-emerald-600/50 text-white shadow-sm' : 'text-slate-500 hover:text-emerald-400'}`}
                 >
                   買入評分 (高→低)
                 </button>
                 <button 
                   onClick={() => setSortBy('sell')}
-                  className={`px-3 py-1.5 text-xs font-bold rounded-md transition-all ${sortBy === 'sell' ? 'bg-red-600 text-white shadow-sm' : 'text-slate-500 hover:text-red-400'}`}
+                  className={`px-3 py-1.5 text-xs font-bold rounded-md transition-all shrink-0 ${sortBy === 'sell' ? 'bg-red-600/50 text-white shadow-sm' : 'text-slate-500 hover:text-red-400'}`}
                 >
                   賣出評分 (高→低)
+                </button>
+                <button 
+                  onClick={() => setSortBy('quality')}
+                  className={`px-3 py-1.5 text-xs font-bold rounded-md transition-all shrink-0 ${sortBy === 'quality' ? 'bg-blue-600 text-white shadow-sm' : 'text-slate-500 hover:text-blue-400'}`}
+                >
+                  Quality (高→低)
+                </button>
+                <button 
+                  onClick={() => setSortBy('value')}
+                  className={`px-3 py-1.5 text-xs font-bold rounded-md transition-all shrink-0 ${sortBy === 'value' ? 'bg-purple-600 text-white shadow-sm' : 'text-slate-500 hover:text-purple-400'}`}
+                >
+                  Value (高→低)
+                </button>
+                <button 
+                  onClick={() => setSortBy('crashSim')}
+                  className={`px-3 py-1.5 text-xs font-bold rounded-md transition-all shrink-0 ${sortBy === 'crashSim' ? 'bg-amber-600 text-white shadow-sm' : 'text-slate-500 hover:text-amber-400'}`}
+                >
+                  崩盤相似度 (高→低)
                 </button>
               </div>
            </div>
@@ -1337,7 +1464,7 @@ const PriceScreener = () => {
                    <th className="p-4 w-24">代號</th>
                    <th className="p-4">名稱</th>
                    <th className="p-4 w-28">價格 (USD)</th>
-                   <th className="p-4 w-64">Socrates 評分</th>
+                   <th className="p-4 min-w-[450px]">Socrates 評分</th>
                    <th className="p-4">週期狀態/簡評</th>
                  </tr>
                </thead>
@@ -1356,7 +1483,11 @@ const PriceScreener = () => {
                        </div>
                      </td>
                      <td className="p-4">
-                        <div className="flex gap-3">
+                        <div className="flex gap-2">
+                           <div className="flex flex-col items-center gap-1">
+                             <ScoreCircle score={item.aiScore ?? 5} type="ai" />
+                             <span className="text-[9px] text-sky-500 font-black uppercase tracking-tighter">AI</span>
+                           </div>
                            <div className="flex flex-col items-center gap-1">
                              <ScoreCircle score={item.buyScore || 0} type="buy" />
                              <span className="text-[9px] text-emerald-500 font-black uppercase tracking-tighter">Buy</span>
@@ -1372,6 +1503,28 @@ const PriceScreener = () => {
                            <div className="flex flex-col items-center gap-1">
                              <ScoreCircle score={item.valueScore || 0} type="value" />
                              <span className="text-[9px] text-purple-500 font-black uppercase tracking-tighter">Val</span>
+                           </div>
+                           <div className="flex flex-col items-center gap-1 relative group" title="最近2次歷史崩盤相似度 (1-10)">
+                             <ScoreCircle score={item.crashSimilarityScore || 0} type="crashSim" />
+                             <span className="text-[9px] text-amber-500 font-black uppercase tracking-tighter whitespace-nowrap">Crash</span>
+                           </div>
+
+                           <div className="flex flex-col items-center justify-center bg-emerald-950/20 p-1.5 rounded-xl border border-emerald-500/20 min-w-[52px] h-[48px] shadow-inner shrink-0 mt-0.5 ml-2">
+                              <span className="text-[8px] font-black text-emerald-500/70 uppercase tracking-widest mb-1 pointer-events-none whitespace-nowrap">Pos.</span>
+                              <div className="flex items-baseline gap-0.5">
+                                 <span className="text-base font-black terminal-text text-emerald-400">
+                                   +{getPosScore(item)}
+                                 </span>
+                              </div>
+                           </div>
+                           
+                           <div className="flex flex-col items-center justify-center bg-rose-950/20 p-1.5 rounded-xl border border-rose-500/20 min-w-[52px] h-[48px] shadow-inner shrink-0 mt-0.5 ml-1">
+                              <span className="text-[8px] font-black text-rose-500/70 uppercase tracking-widest mb-1 pointer-events-none whitespace-nowrap">Neg.</span>
+                              <div className="flex items-baseline gap-0.5">
+                                 <span className="text-base font-black terminal-text text-rose-400">
+                                   +{getNegScore(item)}
+                                 </span>
+                              </div>
                            </div>
                         </div>
                      </td>
@@ -1916,14 +2069,10 @@ const ReportView = ({ report, onGenerate, loading, symbol, stockData }: { report
                     <Activity className="w-3.5 h-3.5 text-rose-400" /> 支撐／壓力評估
                   </h4>
                   <p className="text-slate-300 leading-relaxed text-sm mb-4">{report.newsInsight.supportResistance.analysis}</p>
-                  <div className="grid grid-cols-2 gap-3 mt-auto">
+                  <div className="mt-auto">
                      <div className="bg-slate-800/50 p-3 rounded-lg border border-slate-700/50 flex flex-col justify-center items-center text-center">
                         <span className="text-[10px] uppercase tracking-widest text-slate-500 font-bold block mb-1">止損距離</span>
                         <span className="font-mono font-black text-emerald-400 text-sm whitespace-nowrap">{report.newsInsight.supportResistance.stopLossDistance}</span>
-                     </div>
-                     <div className="bg-slate-800/50 p-3 rounded-lg border border-slate-700/50 flex flex-col justify-center items-center text-center">
-                        <span className="text-[10px] uppercase tracking-widest text-slate-500 font-bold block mb-1">部位大小</span>
-                        <span className="font-mono font-black text-amber-400 text-sm whitespace-nowrap">{report.newsInsight.supportResistance.positionSize}</span>
                      </div>
                   </div>
                </div>
@@ -2241,7 +2390,7 @@ const App = () => {
 
     const results: StockData[] = [];
     try {
-      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
       
       for (let i = 0; i < symbols.length; i++) {
         const sym = symbols[i];
@@ -2253,7 +2402,12 @@ const App = () => {
         Step 2: Collect fundamental data to evaluate Quality Score and Value Score. 
           - Quality Score (1-10): Evaluate based on stable revenue/EPS growth, reasonable/high ROE/ROIC, positive/stable FCF, and moderate debt.
           - Value Score (1-10): Evaluate based on P/E, P/B, EV/EBITDA, PEG. Consider "cheapness" vs "expensiveness". Incorporate red flags like Accounts Receivable growing faster than revenue, frequent one-time charges, or FCF significantly lagging net income.
-        Step 3: Perform the ECM analysis based on historical data patterns and current market context.
+        Step 3: Evaluate Historical Crash Similarity Score (1-10) ("歷史崩盤相似度"):
+          - Review the 2 most recent significant drawdowns for this asset within the past 52 to 260 weeks (1-5 years).
+          - Identify the peak-to-trough drop percentage for those 2 historical crashes.
+          - Compare the current drawdown (from recent ATH) or recent price action to these historical crash percentages. 
+          - The CLOSER the current setup is to the percentage magnitudes of past crashes, the HIGHER the score (meaning it strongly resembles past crashes). The FURTHER away or less severe, the lower the score.
+        Step 4: Perform the ECM analysis based on historical data patterns and current market context.
         
         Output Language: Traditional Chinese (繁體中文).
         
@@ -2272,9 +2426,12 @@ const App = () => {
           "ecmTimelineSummary": "總結 ECM 預測的關鍵時間點與趨勢 (繁體中文)",
           "currentPhaseStatus": "目前價格在 ECM 週期中的具體位置與意義 (繁體中文)",
           "trend": "Bullish" | 'Bearish' | "Neutral",
+          "buyScore": 8,
+          "sellScore": 2,
           "screenerRating": {"score": 8, "action": "Buy"},
           "qualityScore": 8,
           "valueScore": 7,
+          "crashSimilarityScore": 5,
           "supportLevel": 0, 
           "resistanceLevel": 0,
           "historicalHigh": 0, 
@@ -2288,7 +2445,7 @@ const App = () => {
         
         const response = await ai.models.generateContent({ 
           model: 'gemini-3-flash-preview', 
-          contents: prompt + "\n\nCRITICAL: Ensure 'historicalDrawdowns' contains at least 2 to 6 significant historical drawdown cycles with detailed reasons in Traditional Chinese. It MUST include the most recent cycle.", 
+          contents: prompt + "\n\nCRITICAL: Ensure 'historicalDrawdowns' contains at least 3 to 6 significant historical drawdown cycles (must prioritize finding events in the last 2 years). Include detailed reasons in Traditional Chinese. Sort them from newest to oldest.", 
           config: { 
             responseMimeType: 'application/json', 
             tools: [{ googleSearch: {} }], 
@@ -2322,7 +2479,7 @@ const App = () => {
     if (!targetStock?.symbol) return;
     setReportLoading(true);
     try {
-      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
       const prompt = `Generate a comprehensive trading report for "${targetStock.symbol}" (${targetStock.name}) based on Martin Armstrong's Socrates ECM model and recent market news.
       
       The report must include:
@@ -2413,8 +2570,7 @@ const App = () => {
           },
           "supportResistance": {
             "analysis": "能偵測關鍵支撐（前低、重要均線）與壓力位... (繁體中文)",
-            "stopLossDistance": "合適的止損距離，例如 5% (繁體中文)",
-            "positionSize": "建議的部位大小，例如 10% (繁體中文)"
+            "stopLossDistance": "合適的止損距離，例如 5% (繁體中文)"
           },
           "keyDrivers": ["財報", "聯準會利率"]
         },
@@ -2528,7 +2684,7 @@ const App = () => {
     if (syms.length === 0 || updatingPrices) return;
     setUpdatingPrices(true);
     try {
-      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
       const prompt = `Search Yahoo Finance for the latest real-time stock prices and percentage changes for these symbols: ${syms.join(', ')}. 
       Return a JSON object where keys are the Symbols (uppercase) and values are objects containing "price" (number) and "changePercent" (number). 
       Example: {"AAPL": {"price": 150.25, "changePercent": 1.5}}
@@ -2640,39 +2796,35 @@ const App = () => {
               </div>
             )}
             
-            <div className="bg-slate-800 p-5 md:p-6 rounded-3xl border border-slate-700 shadow-[0_0_30px_rgba(0,0,0,0.3)] flex flex-col md:flex-row justify-between items-center gap-6 relative overflow-hidden group">
+            <div className="bg-slate-800 p-5 md:p-6 rounded-3xl border border-slate-700 shadow-[0_0_30px_rgba(0,0,0,0.3)] flex flex-col relative overflow-hidden group">
               <div className="absolute top-0 left-0 w-1.5 h-full bg-amber-500/20 group-hover:bg-amber-500 transition-colors" />
-              <div className="flex flex-col md:flex-row items-center gap-6 w-full">
-                <div className="flex flex-col items-center md:items-start text-center md:text-left">
-                  <h2 className="text-4xl md:text-5xl font-black text-white tracking-tighter mb-1 terminal-text leading-none">{stockData.symbol}</h2>
-                  <div className="flex items-center gap-2 mb-2">
-                    <p className="text-slate-500 font-bold uppercase text-[10px] tracking-[0.2em]">{stockData.name}</p>
-                    <button onClick={handleWatchlist} className={`p-1.5 rounded-full transition-all ${watchlist.some(i => i.symbol === stockData.symbol) ? 'text-amber-500' : 'text-slate-600 hover:text-slate-400'}`} title={watchlist.some(i => i.symbol === stockData.symbol) ? '取消追蹤' : '追蹤'}><Star className={`w-4 h-4 ${watchlist.some(i => i.symbol === stockData.symbol) ? 'fill-current' : ''}`} /></button>
-                  </div>
+              <div className="flex flex-col md:flex-row items-center gap-4 md:gap-6 w-full pl-2">
+                <div className="flex flex-col items-center md:items-start text-center md:text-left shrink-0">
+                  <h2 className="text-4xl md:text-5xl font-black text-white tracking-tighter terminal-text leading-none">{stockData.symbol}</h2>
                 </div>
                 
-                <div className="h-12 w-px bg-slate-700 hidden md:block" />
+                <div className="h-10 w-px bg-slate-700 hidden md:block shrink-0" />
 
-                <div className="flex flex-col items-center md:items-start">
+                <div className="flex flex-col items-center md:items-start shrink-0">
                   <div className="flex items-center gap-4">
                     <div className="flex flex-col">
-                       <div className="flex items-center gap-3">
-                         <span className="text-3xl md:text-4xl font-black text-amber-500 tracking-tighter animate-price-glow terminal-text tabular-nums">
+                       <div className="flex items-center gap-2">
+                         <span className="text-3xl md:text-4xl font-black text-amber-500 tracking-tighter animate-price-glow terminal-text tabular-nums leading-none">
                            ${Number(stockData.price).toLocaleString()}
                          </span>
                          <button 
                            onClick={refreshSinglePrice} 
                            disabled={refreshingSingle}
-                           className="p-1.5 hover:bg-slate-700 rounded-full transition-colors group"
+                           className="p-1 hover:bg-slate-700 rounded-full transition-colors group shrink-0"
                            title="刷新價格"
                          >
                            <RefreshCw className={`w-4 h-4 text-slate-500 group-hover:text-amber-500 ${refreshingSingle ? 'animate-spin' : ''}`} />
                          </button>
-                         <span className={`text-lg font-mono font-bold px-2 py-0.5 rounded ${Number(stockData.changePercent) >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+                       </div>
+                       <div className="flex items-center gap-2 mt-2">
+                         <span className={`text-xs font-mono font-bold px-1.5 py-0.5 rounded bg-slate-900/50 ${Number(stockData.changePercent) >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
                            {Number(stockData.changePercent) >= 0 ? '+' : ''}{stockData.changePercent}%
                          </span>
-                       </div>
-                       <div className="flex items-center gap-2 mt-0.5">
                          <div className="text-[9px] terminal-text text-slate-600 font-bold uppercase tracking-widest flex items-center gap-1">
                            <div className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
                            Updates • {new Date().toLocaleTimeString()}
@@ -2682,52 +2834,105 @@ const App = () => {
                   </div>
                 </div>
 
-                <div className="h-12 w-px bg-slate-700 hidden md:block" />
+                <div className="h-10 w-px bg-slate-700 hidden md:block shrink-0" />
 
-                {stockData.screenerRating && (
-                  <div className="flex flex-col items-center justify-center bg-slate-900/50 p-2 rounded-2xl border border-slate-700/50 min-w-[85px] h-[72px] shadow-inner">
-                     <span className="text-[9px] font-black text-slate-500 uppercase tracking-widest mb-0.5">AI Rating</span>
-                     <div className="flex items-baseline gap-0.5">
-                        <span className={`text-2xl font-black terminal-text ${stockData.screenerRating.action === 'Buy' ? 'text-emerald-400' : stockData.screenerRating.action === 'Sell' ? 'text-rose-400' : 'text-amber-400'}`}>
-                          {stockData.screenerRating.score}
-                        </span>
-                        <span className="text-[10px] text-slate-600 font-bold opacity-70">/10</span>
-                     </div>
-                     <span className={`text-[8px] font-black uppercase text-center leading-none mt-1 ${stockData.screenerRating.action === 'Buy' ? 'text-emerald-500' : stockData.screenerRating.action === 'Sell' ? 'text-rose-500' : 'text-amber-500'}`}>
-                        {stockData.screenerRating.action === 'Buy' ? '推薦買進' : stockData.screenerRating.action === 'Sell' ? '建議賣出' : '觀望'}
-                     </span>
-                  </div>
-                )}
-                
-                {(stockData.qualityScore !== undefined || stockData.valueScore !== undefined) && (
-                  <div className="flex gap-2">
-                    {stockData.qualityScore !== undefined && (
-                      <div className="flex flex-col items-center justify-center bg-slate-900/50 p-2 rounded-2xl border border-slate-700/50 min-w-[85px] h-[72px] shadow-inner">
-                         <span className="text-[9px] font-black text-slate-500 uppercase tracking-widest mb-1 pointer-events-none">Quality</span>
-                         <div className="flex items-baseline gap-0.5">
-                            <span className={`text-2xl font-black terminal-text ${stockData.qualityScore >= 8 ? 'text-emerald-400' : stockData.qualityScore <= 4 ? 'text-rose-400' : 'text-blue-400'}`}>
-                              {stockData.qualityScore}
-                            </span>
-                            <span className="text-[10px] text-slate-600 font-bold opacity-70">/10</span>
-                         </div>
-                      </div>
-                    )}
-                    {stockData.valueScore !== undefined && (
-                      <div className="flex flex-col items-center justify-center bg-slate-900/50 p-2 rounded-2xl border border-slate-700/50 min-w-[85px] h-[72px] shadow-inner">
-                         <span className="text-[9px] font-black text-slate-500 uppercase tracking-widest mb-1 pointer-events-none">Value</span>
-                         <div className="flex items-baseline gap-0.5">
-                            <span className={`text-2xl font-black terminal-text ${stockData.valueScore >= 8 ? 'text-emerald-400' : stockData.valueScore <= 4 ? 'text-rose-400' : 'text-blue-400'}`}>
-                              {stockData.valueScore}
-                            </span>
-                            <span className="text-[10px] text-slate-600 font-bold opacity-70">/10</span>
-                         </div>
-                      </div>
-                    )}
-                  </div>
-                )}
-
-                <div className="flex-1 flex justify-center md:justify-end">
-                   <MiniSparkline color={Number(stockData.changePercent) >= 0 ? "#10b981" : "#f43f5e"} />
+                <div className="flex-1 flex gap-1.5 overflow-x-auto custom-scrollbar no-scrollbar py-1 lg:justify-end">
+                  {stockData.screenerRating && (
+                    <div className="flex flex-col items-center justify-center bg-slate-900/50 p-1.5 rounded-xl border border-slate-700/50 min-w-[58px] h-[52px] shadow-inner shrink-0">
+                       <span className="text-[8px] font-black text-slate-500 uppercase tracking-widest mb-0.5">AI</span>
+                       <div className="flex items-baseline gap-0.5">
+                          <span className={`text-lg font-black terminal-text ${stockData.screenerRating.action === 'Buy' ? 'text-emerald-400' : stockData.screenerRating.action === 'Sell' ? 'text-rose-400' : 'text-amber-400'}`}>
+                            {stockData.screenerRating.score}
+                          </span>
+                          <span className="text-[8px] text-slate-600 font-bold opacity-70">/10</span>
+                       </div>
+                       <span className={`text-[7px] font-black uppercase text-center leading-none mt-1 ${stockData.screenerRating.action === 'Buy' ? 'text-emerald-500' : stockData.screenerRating.action === 'Sell' ? 'text-rose-500' : 'text-amber-500'}`}>
+                          {stockData.screenerRating.action === 'Buy' ? '買進' : stockData.screenerRating.action === 'Sell' ? '賣出' : '觀望'}
+                       </span>
+                    </div>
+                  )}
+                  {stockData.buyScore !== undefined && (
+                    <div className="flex flex-col items-center justify-center bg-slate-900/50 p-1.5 rounded-xl border border-slate-700/50 min-w-[58px] h-[52px] shadow-inner shrink-0">
+                       <span className="text-[8px] font-black text-slate-500 uppercase tracking-widest mb-1 pointer-events-none whitespace-nowrap">Buy</span>
+                       <div className="flex items-baseline gap-0.5">
+                          <span className={`text-lg font-black terminal-text ${stockData.buyScore >= 7 ? 'text-emerald-400' : 'text-slate-400'}`}>
+                            {stockData.buyScore}
+                          </span>
+                          <span className="text-[8px] text-slate-600 font-bold opacity-70">/10</span>
+                       </div>
+                    </div>
+                  )}
+                  {stockData.sellScore !== undefined && (
+                    <div className="flex flex-col items-center justify-center bg-slate-900/50 p-1.5 rounded-xl border border-slate-700/50 min-w-[58px] h-[52px] shadow-inner shrink-0">
+                       <span className="text-[8px] font-black text-slate-500 uppercase tracking-widest mb-1 pointer-events-none whitespace-nowrap">Sell</span>
+                       <div className="flex items-baseline gap-0.5">
+                          <span className={`text-lg font-black terminal-text ${stockData.sellScore >= 7 ? 'text-rose-400' : 'text-slate-400'}`}>
+                            {stockData.sellScore}
+                          </span>
+                          <span className="text-[8px] text-slate-600 font-bold opacity-70">/10</span>
+                       </div>
+                    </div>
+                  )}
+                  {stockData.qualityScore !== undefined && (
+                    <div className="flex flex-col items-center justify-center bg-slate-900/50 p-1.5 rounded-xl border border-slate-700/50 min-w-[58px] h-[52px] shadow-inner shrink-0">
+                       <span className="text-[8px] font-black text-slate-500 uppercase tracking-widest mb-1 pointer-events-none">Qual</span>
+                       <div className="flex items-baseline gap-0.5">
+                          <span className={`text-lg font-black terminal-text ${stockData.qualityScore >= 8 ? 'text-emerald-400' : stockData.qualityScore <= 4 ? 'text-rose-400' : 'text-blue-400'}`}>
+                            {stockData.qualityScore}
+                          </span>
+                          <span className="text-[8px] text-slate-600 font-bold opacity-70">/10</span>
+                       </div>
+                    </div>
+                  )}
+                  {stockData.valueScore !== undefined && (
+                    <div className="flex flex-col items-center justify-center bg-slate-900/50 p-1.5 rounded-xl border border-slate-700/50 min-w-[58px] h-[52px] shadow-inner shrink-0">
+                       <span className="text-[8px] font-black text-slate-500 uppercase tracking-widest mb-1 pointer-events-none">Value</span>
+                       <div className="flex items-baseline gap-0.5">
+                          <span className={`text-lg font-black terminal-text ${stockData.valueScore >= 8 ? 'text-emerald-400' : stockData.valueScore <= 4 ? 'text-rose-400' : 'text-blue-400'}`}>
+                            {stockData.valueScore}
+                          </span>
+                          <span className="text-[8px] text-slate-600 font-bold opacity-70">/10</span>
+                       </div>
+                    </div>
+                  )}
+                  {stockData.crashSimilarityScore !== undefined && (
+                    <div className="flex flex-col items-center justify-center bg-slate-900/50 p-1.5 rounded-xl border border-slate-700/50 min-w-[58px] h-[52px] shadow-inner relative group shrink-0" title="最近2次歷史崩盤相似度 (1-10)\n分數越高代表目前情況與歷史大規模回調越相似 (高風險)">
+                       <span className="text-[8px] font-black text-slate-500 uppercase tracking-widest mb-1 pointer-events-none whitespace-nowrap px-1">Crash</span>
+                       <div className="flex items-baseline gap-0.5">
+                          <span className={`text-lg font-black terminal-text ${stockData.crashSimilarityScore >= 8 ? 'text-rose-400' : stockData.crashSimilarityScore <= 4 ? 'text-emerald-400' : 'text-amber-400'}`}>
+                            {stockData.crashSimilarityScore}
+                          </span>
+                          <span className="text-[8px] text-slate-600 font-bold opacity-70">/10</span>
+                       </div>
+                    </div>
+                  )}
+                  {stockData.screenerRating && (
+                    <div className="flex flex-col items-center justify-center bg-emerald-950/20 p-1.5 rounded-xl border border-emerald-500/20 min-w-[58px] h-[52px] shadow-inner shrink-0">
+                       <span className="text-[8px] font-black text-emerald-500/70 uppercase tracking-widest mb-1 pointer-events-none whitespace-nowrap">Pos.</span>
+                       <div className="flex items-baseline gap-0.5">
+                          <span className="text-lg font-black terminal-text text-emerald-400">
+                            +{getPosScore(stockData)}
+                          </span>
+                       </div>
+                    </div>
+                  )}
+                  {stockData.screenerRating && (
+                    <div className="flex flex-col items-center justify-center bg-rose-950/20 p-1.5 rounded-xl border border-rose-500/20 min-w-[58px] h-[52px] shadow-inner shrink-0">
+                       <span className="text-[8px] font-black text-rose-500/70 uppercase tracking-widest mb-1 pointer-events-none whitespace-nowrap">Neg.</span>
+                       <div className="flex items-baseline gap-0.5">
+                          <span className="text-lg font-black terminal-text text-rose-400">
+                            +{getNegScore(stockData)}
+                          </span>
+                       </div>
+                    </div>
+                  )}
+                </div>
+              </div>
+              
+              <div className="flex items-center justify-between border-t border-slate-700/50 mt-4 pt-3 w-full">
+                <div className="flex items-center gap-2">
+                  <p className="text-slate-400 font-bold uppercase text-xs tracking-widest leading-none">{stockData.name}</p>
+                  <button onClick={handleWatchlist} className={`p-1 rounded-full transition-all ${watchlist.some(i => i.symbol === stockData.symbol) ? 'text-amber-500' : 'text-slate-600 hover:text-slate-400'}`} title={watchlist.some(i => i.symbol === stockData.symbol) ? '取消追蹤' : '追蹤'}><Star className={`w-4 h-4 ${watchlist.some(i => i.symbol === stockData.symbol) ? 'fill-current' : ''}`} /></button>
                 </div>
               </div>
             </div>
