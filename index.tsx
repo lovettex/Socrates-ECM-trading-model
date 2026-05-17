@@ -583,6 +583,141 @@ const VixIndicator = () => {
   );
 };
 
+const ECMCycleIndicator = () => {
+  const [isOpen, setIsOpen] = useState(false);
+
+  // Calculate current point on the cycle
+  const peakDate = new Date('2024-05-07').getTime();
+  const troughDate = new Date('2028-08-25').getTime();
+  const now = new Date().getTime();
+
+  let currentX = 200;
+  if (now >= peakDate && now <= troughDate) {
+    currentX = 200 + 400 * ((now - peakDate) / (troughDate - peakDate));
+  } else if (now < peakDate) {
+    // 4.3 years before peak
+    const prevTrough = new Date('2020-01-18').getTime();
+    currentX = -200 + 400 * ((now - prevTrough) / (peakDate - prevTrough));
+  } else {
+    // past trough
+    const nextPeak = new Date('2032-12-10').getTime();
+    currentX = 600 + 400 * ((now - troughDate) / (nextPeak - troughDate));
+  }
+
+  // Constrain visual bounds
+  const xBounded = Math.max(0, Math.min(800, currentX));
+  const currentY = 120 - 90 * Math.cos((xBounded - 200) * Math.PI / 400);
+
+  const dateOptions: Intl.DateTimeFormatOptions = { year: 'numeric', month: 'short' };
+  const currentDateStr = new Date(now).toLocaleDateString('en-US', dateOptions);
+
+  return (
+    <div className="max-w-2xl mx-auto mt-4 animate-in fade-in slide-in-from-bottom-2">
+      <div className="bg-slate-950/40 border border-slate-800 rounded-3xl overflow-hidden shadow-2xl transition-all duration-500 hover:border-amber-500/30">
+        <button 
+          onClick={() => setIsOpen(!isOpen)}
+          className="w-full flex items-center justify-between px-8 py-4 hover:bg-slate-800/30 transition-colors group"
+        >
+          <div className="flex items-center gap-4">
+            <div className={`p-2 rounded-xl transition-colors ${isOpen ? 'bg-amber-500/20 text-amber-500' : 'bg-slate-800 text-slate-500 group-hover:text-amber-500/70'}`}>
+              <Activity className="w-5 h-5" />
+            </div>
+            <div className="text-left">
+              <span className="text-[10px] font-black uppercase tracking-[0.2em] text-slate-500 block mb-0.5">Macro Sentiment</span>
+              <span className={`text-sm font-black uppercase tracking-wider transition-colors ${isOpen ? 'text-amber-500' : 'text-slate-200'}`}>SOCRATES ECM 週期曲線</span>
+            </div>
+          </div>
+          <ChevronDown className={`w-5 h-5 text-slate-600 transition-transform duration-500 ${isOpen ? 'rotate-180 text-amber-500' : ''}`} />
+        </button>
+        
+        <AnimatePresence>
+          {isOpen && (
+            <motion.div 
+              initial={{ height: 0, opacity: 0 }}
+              animate={{ height: 'auto', opacity: 1 }}
+              exit={{ height: 0, opacity: 0 }}
+              className="border-t border-slate-800/50"
+            >
+              <div className="p-8">
+                <div className="w-full relative py-8 overflow-hidden rounded-2xl bg-slate-950/30 border border-slate-800/50">
+                    {/* SVG Curve */}
+                    <svg viewBox="0 0 800 240" className="w-full drop-shadow-[0_0_12px_rgba(245,158,11,0.5)]">
+                        <defs>
+                            <linearGradient id="ecmGrad" x1="0" y1="0" x2="1" y2="0">
+                                <stop offset="0%" stopColor="#f59e0b" stopOpacity="0.2" />
+                                <stop offset="50%" stopColor="#f59e0b" stopOpacity="1" />
+                                <stop offset="100%" stopColor="#f59e0b" stopOpacity="0.2" />
+                            </linearGradient>
+                            <linearGradient id="glow" x1="0%" y1="0%" x2="0%" y2="100%">
+                                <stop offset="0%" stopColor="#f59e0b" stopOpacity="0.3" />
+                                <stop offset="100%" stopColor="#f59e0b" stopOpacity="0" />
+                            </linearGradient>
+                        </defs>
+
+                        {/* Baseline */}
+                        <line x1="0" y1="120" x2="800" y2="120" stroke="#334155" strokeWidth="1" strokeDasharray="5,5" />
+                        
+                        {/* Area Fill */}
+                        <path d="M 0 120 
+                                 C 100 60, 150 30, 200 30
+                                 C 250 30, 300 60, 400 120
+                                 C 500 180, 550 210, 600 210
+                                 C 650 210, 700 180, 800 120 L 800 240 L 0 240 Z" 
+                              fill="url(#glow)" />
+
+                        {/* the 8.6 year cycle visualization */}
+                        <path d="M 0 120 
+                                 C 100 60, 150 30, 200 30
+                                 C 250 30, 300 60, 400 120
+                                 C 500 180, 550 210, 600 210
+                                 C 650 210, 700 180, 800 120" 
+                              fill="none" stroke="url(#ecmGrad)" strokeWidth="4" strokeLinecap="round" />
+                        
+                        {/* Peak */}
+                        <circle cx="200" cy="30" r="5" fill="#f59e0b" className="animate-pulse" />
+                        <text x="200" y="15" fill="#f59e0b" fontSize="11" fontWeight="bold" textAnchor="middle" className="uppercase tracking-widest font-mono">Top / Peak</text>
+                        <text x="200" y="55" fill="#94a3b8" fontSize="10" textAnchor="middle" className="font-bold">May 2024</text>
+
+                        {/* Midpoint / Axis Crossing Phase */}
+                        <circle cx="400" cy="120" r="4" fill="#64748b" />
+                        <text x="400" y="105" fill="#64748b" fontSize="10" fontWeight="bold" textAnchor="middle" className="uppercase tracking-widest font-mono">Transition</text>
+                        <text x="400" y="140" fill="#64748b" fontSize="10" textAnchor="middle" className="font-bold">July 2026</text>
+
+                        {/* Trough */}
+                        <circle cx="600" cy="210" r="5" fill="#ef4444" className="animate-pulse" />
+                        <text x="600" y="230" fill="#ef4444" fontSize="11" fontWeight="bold" textAnchor="middle" className="uppercase tracking-widest font-mono">Panic / Trough</text>
+                        <text x="600" y="190" fill="#94a3b8" fontSize="10" textAnchor="middle" className="font-bold">Aug 2028</text>
+
+                        {/* You Are Here Marker */}
+                        {currentX >= 0 && currentX <= 800 && (
+                           <g className="animate-in fade-in zoom-in duration-700 delay-300">
+                             <circle cx={xBounded} cy={currentY} r="7" fill="#10b981" stroke="#fff" strokeWidth="2" className="shadow-[0_0_15px_rgba(16,185,129,0.8)]" />
+                             <circle cx={xBounded} cy={currentY} r="14" fill="none" stroke="#10b981" strokeWidth="1" className="animate-ping opacity-50" />
+                             
+                             <line x1={xBounded} y1={currentY} x2={xBounded} y2={currentY > 120 ? currentY - 40 : currentY + 40} stroke="#10b981" strokeDasharray="3,3" />
+                             
+                             <rect x={xBounded - 45} y={currentY > 120 ? currentY - 65 : currentY + 45} width="90" height="24" rx="12" fill="#064e3b" stroke="#10b981" strokeWidth="1" />
+                             <text x={xBounded} y={currentY > 120 ? currentY - 49 : currentY + 61} fill="#fff" fontSize="10" fontWeight="bold" textAnchor="middle" className="uppercase tracking-wider">You Are Here</text>
+                             
+                             <text x={xBounded} y={currentY > 120 ? currentY - 72 : currentY + 84} fill="#10b981" fontSize="10" fontWeight="bold" textAnchor="middle">{currentDateStr}</text>
+                           </g>
+                        )}
+                    </svg>
+                    
+                    <div className="mt-6 p-4 bg-slate-900/80 rounded-xl border border-slate-800 shadow-xl max-w-2xl mx-auto text-center">
+                         <span className="text-amber-500 text-[10px] uppercase font-black tracking-widest block mb-1">Economic Confidence Model (ECM)</span>
+                         <span className="text-slate-400 text-[12px] block leading-relaxed max-w-xl mx-auto font-medium">基於 Martin Armstrong 提出的 8.6 年 Pi 週期。每 8.6 年 (約 3141 天) 會經歷一次重大的資本轉移或經濟拐點。上方為主週期趨勢圖。</span>
+                    </div>
+                </div>
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+      </div>
+    </div>
+  );
+};
+
 const MiniSparkline = ({ color = "#10b981" }) => {
   const points = useMemo(() => {
     const pts = [];
@@ -2227,6 +2362,178 @@ const CloudSettingsModal = ({ isOpen, onClose, url, onSave }: any) => {
   );
 };
 
+const QuickStockHeader = ({ stockData }: { stockData: StockData }) => {
+  if (!stockData) return null;
+  return (
+    <div className="bg-slate-800 p-5 md:p-6 rounded-3xl border border-slate-700 shadow-[0_0_30px_rgba(0,0,0,0.3)] flex flex-col relative overflow-hidden group">
+      <div className="absolute top-0 left-0 w-1.5 h-full bg-amber-500/20 group-hover:bg-amber-500 transition-colors" />
+      <div className="flex flex-col md:flex-row items-center gap-4 md:gap-6 w-full pl-2">
+        <div className="flex flex-col items-center md:items-start text-center md:text-left shrink-0">
+          <h2 className="text-4xl md:text-5xl font-black text-white tracking-tighter terminal-text leading-none">{stockData.symbol}</h2>
+        </div>
+        
+        <div className="h-10 w-px bg-slate-700 hidden md:block shrink-0" />
+
+        <div className="flex flex-col items-center md:items-start shrink-0">
+          <div className="flex items-center gap-4">
+            <div className="flex flex-col">
+               <div className="flex items-center gap-2">
+                 <span className="text-3xl md:text-4xl font-black text-amber-500 tracking-tighter animate-price-glow terminal-text tabular-nums leading-none">
+                   ${Number(stockData.price).toLocaleString()}
+                 </span>
+               </div>
+               <div className="flex items-center gap-2 mt-2">
+                 <span className={`text-xs font-mono font-bold px-1.5 py-0.5 rounded bg-slate-900/50 ${Number(stockData.changePercent) >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+                   {Number(stockData.changePercent) >= 0 ? '+' : ''}{stockData.changePercent}%
+                 </span>
+                 <div className="text-[9px] terminal-text text-slate-600 font-bold uppercase tracking-widest flex items-center gap-1">
+                   <div className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                   LIVE
+                 </div>
+               </div>
+            </div>
+          </div>
+        </div>
+
+        <div className="h-10 w-px bg-slate-700 hidden md:block shrink-0" />
+
+        <div className="flex md:ml-8 lg:ml-16 items-center gap-1.5 overflow-x-auto custom-scrollbar no-scrollbar py-1">
+          {stockData.screenerRating && (
+            <div className="flex flex-col items-center justify-center bg-slate-900/50 p-1.5 rounded-xl border border-slate-700/50 min-w-[58px] h-[52px] shadow-inner shrink-0">
+               <span className="text-[8px] font-black text-slate-500 uppercase tracking-widest mb-0.5">AI</span>
+               <div className="flex items-baseline gap-0.5">
+                  <span className={`text-lg font-black terminal-text ${stockData.screenerRating.action === 'Buy' ? 'text-emerald-400' : stockData.screenerRating.action === 'Sell' ? 'text-rose-400' : 'text-amber-400'}`}>
+                    {stockData.screenerRating.score}
+                  </span>
+                  <span className="text-[8px] text-slate-600 font-bold opacity-70">/10</span>
+               </div>
+               <span className={`text-[7px] font-black uppercase text-center leading-none mt-1 ${stockData.screenerRating.action === 'Buy' ? 'text-emerald-500' : stockData.screenerRating.action === 'Sell' ? 'text-rose-500' : 'text-amber-500'}`}>
+                  {stockData.screenerRating.action === 'Buy' ? '買進' : stockData.screenerRating.action === 'Sell' ? '賣出' : '觀望'}
+               </span>
+            </div>
+          )}
+          {stockData.buyScore !== undefined && (
+            <div className="flex flex-col items-center justify-center bg-slate-900/50 p-1.5 rounded-xl border border-slate-700/50 min-w-[58px] h-[52px] shadow-inner shrink-0">
+               <span className="text-[8px] font-black text-slate-500 uppercase tracking-widest mb-1 pointer-events-none whitespace-nowrap">Buy</span>
+               <div className="flex items-baseline gap-0.5">
+                  <span className={`text-lg font-black terminal-text ${stockData.buyScore >= 7 ? 'text-emerald-400' : 'text-slate-400'}`}>
+                    {stockData.buyScore}
+                  </span>
+                  <span className="text-[8px] text-slate-600 font-bold opacity-70">/10</span>
+               </div>
+            </div>
+          )}
+          {stockData.sellScore !== undefined && (
+            <div className="flex flex-col items-center justify-center bg-slate-900/50 p-1.5 rounded-xl border border-slate-700/50 min-w-[58px] h-[52px] shadow-inner shrink-0">
+               <span className="text-[8px] font-black text-slate-500 uppercase tracking-widest mb-1 pointer-events-none whitespace-nowrap">Sell</span>
+               <div className="flex items-baseline gap-0.5">
+                  <span className={`text-lg font-black terminal-text ${stockData.sellScore >= 7 ? 'text-rose-400' : 'text-slate-400'}`}>
+                    {stockData.sellScore}
+                  </span>
+                  <span className="text-[8px] text-slate-600 font-bold opacity-70">/10</span>
+               </div>
+            </div>
+          )}
+          {stockData.qualityScore !== undefined && (
+            <div className="flex flex-col items-center justify-center bg-slate-900/50 p-1.5 rounded-xl border border-slate-700/50 min-w-[58px] h-[52px] shadow-inner shrink-0">
+               <span className="text-[8px] font-black text-slate-500 uppercase tracking-widest mb-1 pointer-events-none">Qual</span>
+               <div className="flex items-baseline gap-0.5">
+                  <span className={`text-lg font-black terminal-text ${stockData.qualityScore >= 8 ? 'text-emerald-400' : stockData.qualityScore <= 4 ? 'text-rose-400' : 'text-blue-400'}`}>
+                    {stockData.qualityScore}
+                  </span>
+                  <span className="text-[8px] text-slate-600 font-bold opacity-70">/10</span>
+               </div>
+            </div>
+          )}
+          {stockData.valueScore !== undefined && (
+            <div className="flex flex-col items-center justify-center bg-slate-900/50 p-1.5 rounded-xl border border-slate-700/50 min-w-[58px] h-[52px] shadow-inner shrink-0">
+               <span className="text-[8px] font-black text-slate-500 uppercase tracking-widest mb-1 pointer-events-none">Value</span>
+               <div className="flex items-baseline gap-0.5">
+                  <span className={`text-lg font-black terminal-text ${stockData.valueScore >= 8 ? 'text-emerald-400' : stockData.valueScore <= 4 ? 'text-rose-400' : 'text-blue-400'}`}>
+                    {stockData.valueScore}
+                  </span>
+                  <span className="text-[8px] text-slate-600 font-bold opacity-70">/10</span>
+               </div>
+            </div>
+          )}
+          {stockData.crashSimilarityScore !== undefined && (
+            <div className="flex flex-col items-center justify-center bg-slate-900/50 p-1.5 rounded-xl border border-slate-700/50 min-w-[58px] h-[52px] shadow-inner relative group shrink-0" title="最近2次歷史崩盤相似度 (1-10)\n分數越高代表目前情況與歷史大規模回調越相似 (高風險)">
+               <span className="text-[8px] font-black text-slate-500 uppercase tracking-widest mb-1 pointer-events-none whitespace-nowrap px-1">Crash</span>
+               <div className="flex items-baseline gap-0.5">
+                  <span className={`text-lg font-black terminal-text ${stockData.crashSimilarityScore >= 8 ? 'text-rose-400' : stockData.crashSimilarityScore <= 4 ? 'text-emerald-400' : 'text-amber-400'}`}>
+                    {stockData.crashSimilarityScore}
+                  </span>
+                  <span className="text-[8px] text-slate-600 font-bold opacity-70">/10</span>
+               </div>
+            </div>
+          )}
+          {stockData.screenerRating && (
+            <div className="flex flex-col items-center justify-center bg-emerald-950/20 p-1.5 rounded-xl border border-emerald-500/20 min-w-[58px] h-[52px] shadow-inner shrink-0">
+               <span className="text-[8px] font-black text-emerald-500/70 uppercase tracking-widest mb-1 pointer-events-none whitespace-nowrap">Pos.</span>
+               <div className="flex items-baseline gap-0.5">
+                  <span className="text-lg font-black terminal-text text-emerald-400">
+                    +{getPosScore(stockData)}
+                  </span>
+               </div>
+            </div>
+          )}
+          {stockData.screenerRating && (
+            <div className="flex flex-col items-center justify-center bg-rose-950/20 p-1.5 rounded-xl border border-rose-500/20 min-w-[58px] h-[52px] shadow-inner shrink-0">
+               <span className="text-[8px] font-black text-rose-500/70 uppercase tracking-widest mb-1 pointer-events-none whitespace-nowrap">Neg.</span>
+               <div className="flex items-baseline gap-0.5">
+                  <span className="text-lg font-black terminal-text text-rose-400">
+                    +{getNegScore(stockData)}
+                  </span>
+               </div>
+            </div>
+          )}
+          <button 
+            onClick={() => {
+                const scoreData = {
+                    symbol: stockData.symbol,
+                    price: stockData.price,
+                    aiScore: stockData.screenerRating?.score ?? 5,
+                    buyScore: stockData.buyScore,
+                    sellScore: stockData.sellScore,
+                    qualityScore: stockData.qualityScore,
+                    valueScore: stockData.valueScore,
+                    crashSimilarityScore: stockData.crashSimilarityScore,
+                    posScore: getPosScore(stockData),
+                    negScore: getNegScore(stockData),
+                    timestamp: new Date().toISOString()
+                };
+                const dataStr = JSON.stringify(scoreData, null, 2);
+                const dataUri = 'data:application/json;charset=utf-8,' + encodeURIComponent(dataStr);
+                const link = document.createElement('a');
+                link.setAttribute('href', dataUri);
+                link.setAttribute('download', `${stockData.symbol}_scores.json`);
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+            }}
+            className="flex flex-col items-center justify-center bg-slate-900/50 p-1.5 rounded-xl border border-slate-700/50 min-w-[58px] h-[52px] shadow-inner shrink-0 hover:bg-slate-800 hover:border-amber-500/50 transition-all cursor-pointer group ml-1"
+            title="匯出評分 JSON"
+          >
+             <Download className="w-5 h-5 text-slate-500 group-hover:text-amber-500 transition-colors mb-1" />
+             <span className="text-[7px] font-black text-slate-500 uppercase tracking-widest leading-none group-hover:text-amber-500 transition-colors">JSON</span>
+          </button>
+        </div>
+      </div>
+      {(stockData.name || stockData.sector) && (
+        <div className="mt-4 pt-4 border-t border-slate-700/50 flex flex-wrap items-center gap-x-4 gap-y-2 text-xs font-bold uppercase tracking-widest text-slate-500 pl-2">
+            <span>{stockData.name}</span>
+            {stockData.sector && (
+               <>
+                 <div className="w-1 h-1 rounded-full bg-slate-700" />
+                 <span className="text-amber-500/70">{stockData.sector}</span>
+               </>
+            )}
+        </div>
+      )}
+    </div>
+  );
+};
+
 const App = () => {
   const [inputSymbol, setInputSymbol] = useState('');
   const [stockResults, setStockResults] = useState<StockData[]>([]);
@@ -2234,6 +2541,11 @@ const App = () => {
   const stockData = stockResults[currentStockIndex] || null;
   const [loading, setLoading] = useState(false);
   const [loadingProgress, setLoadingProgress] = useState('');
+
+  const [quickInputSymbol, setQuickInputSymbol] = useState('');
+  const [quickLoading, setQuickLoading] = useState(false);
+  const [quickLoadingProgress, setQuickLoadingProgress] = useState('');
+  const [quickResults, setQuickResults] = useState<StockData[]>([]);
   const [viewTab, setViewTab] = useState<'analysis' | 'screener' | 'report'>('analysis');
   const [reports, setReports] = useState<Record<string, StockReport>>({});
   const report = stockData ? reports[stockData.symbol] || null : null;
@@ -2444,7 +2756,7 @@ const App = () => {
         }`;
         
         const response = await ai.models.generateContent({ 
-          model: 'gemini-3-flash-preview', 
+          model: 'gemini-3.1-pro-preview', 
           contents: prompt + "\n\nCRITICAL: Ensure 'historicalDrawdowns' contains at least 3 to 6 significant historical drawdown cycles (must prioritize finding events in the last 2 years). Include detailed reasons in Traditional Chinese. Sort them from newest to oldest.", 
           config: { 
             responseMimeType: 'application/json', 
@@ -2471,6 +2783,81 @@ const App = () => {
     } finally { 
       setLoading(false); 
       setLoadingProgress('');
+    }
+  };
+
+  const fetchQuickAnalysis = async () => {
+    if (!quickInputSymbol.trim()) return;
+    const symbols = quickInputSymbol.split(',').map(s => s.trim().toUpperCase()).filter(s => s !== '');
+    if (symbols.length === 0) return;
+
+    setQuickLoading(true);
+    setQuickResults([]);
+
+    const results: StockData[] = [];
+    try {
+      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+      
+      for (let i = 0; i < symbols.length; i++) {
+        const sym = symbols[i];
+        setQuickLoadingProgress(`正在快速分析第 ${i + 1}/${symbols.length} 個標的: ${sym}...`);
+        
+        const prompt = `You are Martin Armstrong's Socrates AI. Perform a quick review and ECM cycle analysis for "${sym}".
+        
+        Step 1: CRITICAL - Use Google Search to find the ABSOLUTELY LATEST real-time price, change percentage, and currency for "${sym}" from Yahoo Finance. Look at the live quote page.
+        Step 2: Collect fundamental data to evaluate Quality Score and Value Score. 
+          - Quality Score (1-10): Evaluate based on stable revenue/EPS growth, reasonable/high ROE/ROIC, positive/stable FCF, and moderate debt.
+          - Value Score (1-10): Evaluate based on P/E, P/B, EV/EBITDA, PEG. Consider "cheapness" vs "expensiveness". Incorporate red flags like Accounts Receivable growing faster than revenue, frequent one-time charges, or FCF significantly lagging net income.
+        Step 3: Evaluate Historical Crash Similarity Score (1-10) ("歷史崩盤相似度"):
+          - Review the 2 most recent significant drawdowns for this asset within the past 52 to 260 weeks (1-5 years).
+          - Identify the peak-to-trough drop percentage for those 2 historical crashes.
+          - Compare the current drawdown (from recent ATH) or recent price action to these historical crash percentages. 
+          - The CLOSER the current setup is to the percentage magnitudes of past crashes, the HIGHER the score (meaning it strongly resembles past crashes). The FURTHER away or less severe, the lower the score.
+        Step 4: Based on the above, establish a buyScore (1-10) and sellScore (1-10). These should generally be inverse but can deviate if the situation is highly uncertain.
+        Step 5: Provide an overall screenerRating (score 1-10, action: Buy/Sell/Neutral) reflecting AI rating.
+        Step 6: Answer as a single JSON object.
+        
+        Output JSON Structure:
+        {
+          "symbol": "${sym}", 
+          "name": "...", 
+          "sector": "...",
+          "price": 0.00, 
+          "changePercent": 0.00, 
+          "currency": "USD",
+          "buyScore": 8,
+          "sellScore": 2,
+          "screenerRating": {"score": 8, "action": "Buy"},
+          "qualityScore": 8,
+          "valueScore": 7,
+          "crashSimilarityScore": 5
+        }`;
+        
+        const response = await ai.models.generateContent({ 
+          model: 'gemini-3.1-pro-preview', 
+          contents: prompt, 
+          config: { 
+            responseMimeType: 'application/json', 
+            tools: [{ googleSearch: {} }], 
+            temperature: 0.1 
+          } 
+        });
+        
+        const data = safeParseJson(response.text || '{}');
+        if (data.symbol) {
+          results.push(data);
+          setCachedPrices(prev => ({ ...prev, [data.symbol]: { price: Number(data.price), change: 0, changePercent: Number(data.changePercent), prevClose: 0, time: new Date().toLocaleTimeString(), lastUpdated: Date.now() } }));
+        }
+      }
+      
+      if (results.length > 0) {
+        setQuickResults(results);
+      }
+    } catch (err: any) { 
+      console.error(err);
+    } finally { 
+      setQuickLoading(false); 
+      setQuickLoadingProgress('');
     }
   };
 
@@ -2744,27 +3131,69 @@ const App = () => {
       </header>
 
       <main className="max-w-6xl mx-auto p-4 md:p-8 space-y-8">
-        <div className="relative group max-w-2xl mx-auto">
-          <Search className="absolute left-6 top-1/2 -translate-y-1/2 text-slate-500 group-hover:text-amber-500 transition-colors z-10" />
-          <input 
-            type="text" 
-            value={inputSymbol} 
-            onChange={(e) => setInputSymbol(e.target.value.toUpperCase())} 
-            onKeyDown={(e) => e.key === 'Enter' && fetchAnalysis()} 
-            placeholder="代號 (e.g., NVDA)..." 
-            className="w-full bg-slate-950 border-2 border-slate-700/50 px-14 py-5 rounded-3xl focus:outline-none focus:ring-4 focus:ring-amber-500/10 focus:border-amber-500/50 hover:border-emerald-500/50 hover:shadow-[0_0_30px_rgba(16,185,129,0.1)] text-xl font-mono transition-all placeholder:text-slate-600" 
-          />
-          <button 
-            onClick={fetchAnalysis} 
-            disabled={loading} 
-            className="absolute right-3 top-3 bg-amber-600 hover:bg-amber-500 text-white p-3.5 rounded-2xl transition-all shadow-lg active:scale-95"
-          >
-            {loading ? <Loader2 className="w-6 h-6 animate-spin" /> : <Search className="w-6 h-6" />}
-          </button>
+        <div className="flex flex-col md:flex-row gap-4 max-w-4xl mx-auto">
+          {/* Main Search */}
+          <div className="relative group flex-1">
+            <Search className="absolute left-6 top-1/2 -translate-y-1/2 text-slate-500 group-hover:text-amber-500 transition-colors z-10" />
+            <input 
+              type="text" 
+              value={inputSymbol} 
+              onChange={(e) => setInputSymbol(e.target.value.toUpperCase())} 
+              onKeyDown={(e) => e.key === 'Enter' && fetchAnalysis()} 
+              placeholder="代號 (e.g., NVDA)..." 
+              className="w-full bg-slate-950 border-2 border-slate-700/50 pl-14 pr-16 py-4 rounded-3xl focus:outline-none focus:ring-4 focus:ring-amber-500/10 focus:border-amber-500/50 hover:border-emerald-500/50 hover:shadow-[0_0_30px_rgba(16,185,129,0.1)] text-lg font-mono transition-all placeholder:text-slate-600" 
+            />
+            <button 
+              onClick={fetchAnalysis} 
+              disabled={loading} 
+              className="absolute right-2 top-2 bg-amber-600 hover:bg-amber-500 text-white p-3 rounded-2xl transition-all shadow-lg active:scale-95"
+            >
+              {loading ? <Loader2 className="w-5 h-5 animate-spin" /> : <Search className="w-5 h-5" />}
+            </button>
+            <div className="absolute -top-3 left-6 bg-[#0f172a] px-2 text-[10px] font-bold text-slate-500 uppercase tracking-widest hidden md:block">完整週期分析</div>
+          </div>
+
+          {/* Quick Search */}
+          <div className="relative group flex-1">
+            <Zap className="absolute left-6 top-1/2 -translate-y-1/2 text-slate-500 group-hover:text-amber-500 transition-colors z-10" />
+            <input 
+              type="text" 
+              value={quickInputSymbol} 
+              onChange={(e) => setQuickInputSymbol(e.target.value.toUpperCase())} 
+              onKeyDown={(e) => e.key === 'Enter' && fetchQuickAnalysis()} 
+              placeholder="快速模式 (META,CRM...)" 
+              className="w-full bg-slate-950 border-2 border-slate-700/50 pl-14 pr-16 py-4 rounded-3xl focus:outline-none focus:ring-4 focus:ring-amber-500/10 focus:border-amber-500/50 hover:border-emerald-500/50 hover:shadow-[0_0_30px_rgba(16,185,129,0.1)] text-lg font-mono transition-all placeholder:text-slate-600" 
+            />
+            <button 
+              onClick={fetchQuickAnalysis} 
+              disabled={quickLoading} 
+              className="absolute right-2 top-2 bg-slate-800 hover:bg-slate-700 text-amber-500 p-3 rounded-2xl transition-all shadow-lg active:scale-95 border border-slate-700"
+            >
+              {quickLoading ? <Loader2 className="w-5 h-5 animate-spin" /> : <Zap className="w-5 h-5" />}
+            </button>
+            <div className="absolute -top-3 left-6 bg-[#0f172a] px-2 text-[10px] font-bold text-slate-500 uppercase tracking-widest hidden md:block">快速評分模式 (支援多個標的)</div>
+          </div>
         </div>
+
+        {quickLoading && (
+          <div className="flex flex-col items-center justify-center gap-3 mt-4 text-emerald-500 animate-in fade-in slide-in-from-top-2">
+            <Loader2 className="w-8 h-8 animate-spin" />
+            <span className="font-bold text-lg">快速評分運算中...</span>
+            {quickLoadingProgress && <span className="text-sm text-slate-500 font-mono">{quickLoadingProgress}</span>}
+          </div>
+        )}
+
+        {quickResults.length > 0 && (
+          <div className="space-y-4 max-w-4xl mx-auto animate-in fade-in slide-in-from-bottom-4">
+            {quickResults.map((res, idx) => (
+              <QuickStockHeader key={idx} stockData={res} />
+            ))}
+          </div>
+        )}
         
         <BuffettIndicator />
         <VixIndicator />
+        <ECMCycleIndicator />
         
         {loading && (
           <div className="flex flex-col items-center justify-center gap-3 mt-4 text-amber-500 animate-in fade-in slide-in-from-top-2">
@@ -2836,7 +3265,7 @@ const App = () => {
 
                 <div className="h-10 w-px bg-slate-700 hidden md:block shrink-0" />
 
-                <div className="flex-1 flex gap-1.5 overflow-x-auto custom-scrollbar no-scrollbar py-1 lg:justify-end">
+                <div className="flex md:ml-8 lg:ml-16 items-center gap-1.5 overflow-x-auto custom-scrollbar no-scrollbar py-1">
                   {stockData.screenerRating && (
                     <div className="flex flex-col items-center justify-center bg-slate-900/50 p-1.5 rounded-xl border border-slate-700/50 min-w-[58px] h-[52px] shadow-inner shrink-0">
                        <span className="text-[8px] font-black text-slate-500 uppercase tracking-widest mb-0.5">AI</span>
@@ -2926,6 +3355,36 @@ const App = () => {
                        </div>
                     </div>
                   )}
+                  <button 
+                    onClick={() => {
+                        const scoreData = {
+                            symbol: stockData.symbol,
+                            price: stockData.price,
+                            aiScore: stockData.screenerRating?.score ?? 5,
+                            buyScore: stockData.buyScore,
+                            sellScore: stockData.sellScore,
+                            qualityScore: stockData.qualityScore,
+                            valueScore: stockData.valueScore,
+                            crashSimilarityScore: stockData.crashSimilarityScore,
+                            posScore: getPosScore(stockData),
+                            negScore: getNegScore(stockData),
+                            timestamp: new Date().toISOString()
+                        };
+                        const dataStr = JSON.stringify(scoreData, null, 2);
+                        const dataUri = 'data:application/json;charset=utf-8,' + encodeURIComponent(dataStr);
+                        const link = document.createElement('a');
+                        link.setAttribute('href', dataUri);
+                        link.setAttribute('download', `${stockData.symbol}_scores.json`);
+                        document.body.appendChild(link);
+                        link.click();
+                        document.body.removeChild(link);
+                    }}
+                    className="flex flex-col items-center justify-center bg-slate-900/50 p-1.5 rounded-xl border border-slate-700/50 min-w-[58px] h-[52px] shadow-inner shrink-0 hover:bg-slate-800 hover:border-amber-500/50 transition-all cursor-pointer group ml-1"
+                    title="匯出評分 JSON"
+                  >
+                     <Download className="w-5 h-5 text-slate-500 group-hover:text-amber-500 transition-colors mb-1" />
+                     <span className="text-[7px] font-black text-slate-500 uppercase tracking-widest leading-none group-hover:text-amber-500 transition-colors">JSON</span>
+                  </button>
                 </div>
               </div>
               
