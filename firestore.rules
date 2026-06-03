@@ -1,0 +1,88 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // 1. Global Safety Net: Default Deny All
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- Global Helpers ---
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    // Enforces secure IDs
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-\\.]+$');
+    }
+
+    // --- Entity Specific Validators ---
+    function isValidTrade(data) {
+      return data.keys().hasAll(['id', 'symbol', 'name', 'type', 'price', 'shares', 'date', 'timestamp', 'userId'])
+        && data.keys().size() == 9
+        && data.id is string && data.id.size() <= 128
+        && data.symbol is string && data.symbol.size() <= 16
+        && data.name is string && data.name.size() <= 200
+        && data.type in ['Buy', 'MarginBuy', 'Short', 'Sell']
+        && data.price is number
+        && data.shares is number
+        && data.date is string && data.date.size() <= 32
+        && data.timestamp is number
+        && data.userId is string && data.userId == request.auth.uid;
+    }
+
+    function isValidWatchlist(data) {
+      return data.keys().hasAll(['symbol', 'name', 'price', 'changePercent', 'timestamp', 'userId'])
+        && data.symbol is string && data.symbol.size() <= 16
+        && data.name is string && data.name.size() <= 200
+        && data.price is number
+        && data.changePercent is number
+        && data.timestamp is number
+        && data.userId is string && data.userId == request.auth.uid;
+    }
+
+    // --- Routes (Users sandboxed paths) ---
+    match /users/{userId} {
+      allow read, write: if isOwner(userId);
+
+      // Subcollection: Trades
+      match /trades/{tradeId} {
+        allow read: if isOwner(userId);
+        allow write: if isOwner(userId) && isValidId(tradeId);
+        
+        allow create: if isOwner(userId) 
+          && isValidId(tradeId) 
+          && isValidTrade(request.resource.data);
+          
+        allow update: if isOwner(userId) 
+          && isValidId(tradeId) 
+          && isValidTrade(request.resource.data)
+          && request.resource.data.userId == resource.data.userId;
+          
+        allow delete: if isOwner(userId);
+      }
+
+      // Subcollection: Watchlists
+      match /watchlist/{symbol} {
+        allow read: if isOwner(userId);
+        allow write: if isOwner(userId) && isValidId(symbol);
+
+        allow create: if isOwner(userId) 
+          && isValidId(symbol) 
+          && isValidWatchlist(request.resource.data);
+          
+        allow update: if isOwner(userId) 
+          && isValidId(symbol) 
+          && isValidWatchlist(request.resource.data)
+          && request.resource.data.userId == resource.data.userId;
+          
+        allow delete: if isOwner(userId);
+      }
+    }
+  }
+}

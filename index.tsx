@@ -6,11 +6,42 @@ import React, {
   useCallback,
 } from "react";
 import { createRoot } from "react-dom/client";
-import { GoogleGenAI, Type } from "@google/genai";
+import { Type } from "@google/genai";
+
+// Polyfill process.env for client-side to prevent ReferenceError crashes when process.env.GEMINI_API_KEY is referenced
+if (typeof window !== "undefined" && !(window as any).process) {
+  (window as any).process = { env: {} };
+}
+
+class GoogleGenAI {
+  constructor(config?: { apiKey?: string; httpOptions?: any }) {}
+  get models() {
+    return {
+      generateContent: async (params: { model: string; contents: any; config?: any }) => {
+        const response = await fetch("/api/gemini/generate", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(params),
+        });
+        if (!response.ok) {
+          const errMsg = await response.text();
+          throw new Error(`Gemini API Error: ${errMsg}`);
+        }
+        const data = await response.json();
+        return data;
+      }
+    };
+  }
+}
 import { jsPDF } from "jspdf";
 import html2canvas from "html2canvas";
 import { motion, AnimatePresence } from "framer-motion";
 import * as gdrive from "./googleDrive";
+import * as workspace from "./workspace";
+import { collection, getDocs, doc, setDoc, deleteDoc } from "firebase/firestore";
+import { db, handleFirestoreError, OperationType } from "./firebase";
 import {
   RefreshCw,
   Search,
@@ -71,7 +102,14 @@ import {
   Bot,
   Scale,
   ShieldCheck,
+  HelpCircle,
+  Cpu,
+  Compass,
 } from "lucide-react";
+
+import { MacroFilterView } from "./macroFilter";
+import { AlphaMatrixView } from "./alphaMatrix";
+import { PortfolioView } from "./portfolio";
 
 // --- Types ---
 
@@ -121,11 +159,44 @@ interface BacktestResult {
   improvements: string[];
 }
 
+interface FinancialHealth {
+  status: "衰退" | "強勁";
+  overview: string;
+  metrics: {
+    revenueGrowth: string;
+    netProfitTrend: string;
+    freeCashFlow: string;
+    profitMargins: string;
+    debtLevels: string;
+    returnOnEquity: string;
+  };
+}
+
+interface RiskItem {
+  category: "經濟風險" | "行業顛覆" | "競爭" | "監管威脅" | "債務或財務風險" | "公司政策導向與挑戰";
+  severity: "低" | "中" | "高";
+  description: string;
+}
+
+interface RiskAnalysis {
+  riskLevel: "低" | "觀察" | "高";
+  risks: RiskItem[];
+  debate: {
+    bullishAnalystName: string;
+    bullishArguments: string[];
+    bearishAnalystName: string;
+    bearishArguments: string[];
+    conclusion: string;
+  };
+}
+
 interface StockReport {
   symbol: string;
   tradingStrategy: TradingStrategy;
   newsInsight?: NewsInsight;
   backtest: BacktestResult;
+  financialHealth?: FinancialHealth;
+  riskAnalysis?: RiskAnalysis;
   generatedAt: number;
 }
 
@@ -160,6 +231,7 @@ interface StockData {
   price: number;
   changePercent: number;
   currency: string;
+  sector?: string;
   lastAnchorDate: string;
   anchorType: "High" | "Low";
   nextTurningPoint: string;
@@ -206,6 +278,29 @@ interface WatchlistItem {
   price: number;
   changePercent: number;
   timestamp: number;
+  buyScore?: number;
+  sellScore?: number;
+  qualityScore?: number;
+  valueScore?: number;
+  crashSimilarityScore?: number;
+  posScore?: number;
+  negScore?: number;
+  aiScore?: number;
+  action?: string;
+  history?: Array<{
+    timestamp: number;
+    price: number;
+    changePercent: number;
+    buyScore?: number;
+    sellScore?: number;
+    qualityScore?: number;
+    valueScore?: number;
+    crashSimilarityScore?: number;
+    posScore?: number;
+    negScore?: number;
+    aiScore?: number;
+    action?: string;
+  }>;
 }
 
 interface MarketData {
@@ -229,7 +324,9 @@ interface ScreenerItem {
   qualityScore?: number;
   valueScore?: number;
   crashSimilarityScore?: number;
+  supportPrice?: number;
   ecmStatus?: string;
+  technicalPattern?: string;
 }
 
 // --- Helper Functions ---
@@ -294,6 +391,12 @@ const safeParseJson = (text: string) => {
 
     // 4. Remove trailing commas in objects or arrays
     s = s.replace(/,\s*(\r?\n?\s*[\}\]])/g, "$1");
+
+    // 5. Repair string or general array corruption where the LLM wrote "key": 。", instead of "key": [
+    s = s.replace(
+      /"([a-zA-Z0-9_]+)"\s*:\s*。\s*"?\s*,?\s*(?=\r?\n?\s*["{\[\d])/g,
+      '"$1": [\n',
+    );
 
     return s;
   };
@@ -1803,6 +1906,8 @@ const DrawdownChart = ({ drawdowns }: { drawdowns: DrawdownEvent[] }) => {
 };
 
 const HistoricalDrawdownView = ({ data }: { data: StockData }) => {
+  const [isOpen, setIsOpen] = useState(false);
+
   if (!data.historicalDrawdowns || data.historicalDrawdowns.length === 0) {
     return (
       <div className="text-center py-20 text-slate-500 opacity-50">
@@ -1813,75 +1918,125 @@ const HistoricalDrawdownView = ({ data }: { data: StockData }) => {
   }
 
   return (
-    <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500">
-      <DrawdownChart drawdowns={data.historicalDrawdowns} />
+    <div className="bg-slate-800 rounded-3xl border border-slate-700 overflow-hidden shadow-xl mb-4 flex flex-col transition-colors hover:border-slate-600">
+      <button
+        onClick={() => setIsOpen(!isOpen)}
+        className="p-6 bg-slate-900/80 border-b border-slate-700 flex items-center justify-between w-full text-left cursor-pointer hover:bg-slate-800/80 transition-colors"
+      >
+        <div className="flex items-center gap-3">
+          <div className="p-2 bg-rose-500/20 rounded-lg">
+            <List className="w-6 h-6 text-rose-400" />
+          </div>
+          <h3 className="text-xl font-black text-white flex items-center gap-2">
+            歷史回調與事件原因
+            {!isOpen && (
+              <span className="text-xs bg-indigo-500/20 text-indigo-300 font-bold px-2 py-1 rounded-md ml-2 border border-indigo-500/30">
+                打開才載入分析資料
+              </span>
+            )}
+          </h3>
+        </div>
+        <div className="flex items-center gap-2">
+          {isOpen ? (
+            <ChevronUp className="w-5 h-5 text-slate-400" />
+          ) : (
+            <ChevronDown className="w-5 h-5 text-slate-400" />
+          )}
+        </div>
+      </button>
 
-      <div className="bg-slate-800 rounded-3xl border border-slate-700 overflow-hidden shadow-xl">
-        <div className="p-4 bg-slate-900 border-b border-slate-700 flex items-center justify-between">
-          <span className="font-black text-sm uppercase tracking-widest text-white flex items-center gap-2">
-            <List className="w-5 h-5 text-amber-500" /> 歷史回調與事件原因
-          </span>
-        </div>
-        <div className="overflow-x-auto custom-scrollbar">
-          <table className="w-full text-left text-sm">
-            <thead className="bg-slate-950 text-slate-500">
-              <tr>
-                <th className="p-4 w-32">週期 (高點-低點)</th>
-                <th className="p-4 w-24">高點價格</th>
-                <th className="p-4 w-24">低點價格</th>
-                <th className="p-4 w-20">跌幅</th>
-                <th className="p-4">恐慌/下跌原因</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-slate-700/50">
-              {[...(data.historicalDrawdowns || [])]
-                .filter((d): d is DrawdownEvent => !!d)
-                .sort((a, b) => {
-                  const aTime = a.highDate ? new Date(a.highDate).getTime() : 0;
-                  const bTime = b.highDate ? new Date(b.highDate).getTime() : 0;
-                  return (
-                    (isNaN(bTime) ? 0 : bTime) - (isNaN(aTime) ? 0 : aTime)
-                  );
-                })
-                .map((item, idx) => (
-                  <tr
-                    key={idx}
-                    className="hover:bg-slate-700/30 transition-colors group"
-                  >
-                    <td className="p-4">
-                      <div className="font-bold text-emerald-400">
-                        {item.highDate}
-                      </div>
-                      <div className="text-slate-500 text-xs my-0.5">to</div>
-                      <div className="font-bold text-red-400">
-                        {item.lowDate}
-                      </div>
-                    </td>
-                    <td className="p-4 font-bold text-slate-300 terminal-text tabular-nums">
-                      ${(item.highPrice ?? 0).toLocaleString()}
-                    </td>
-                    <td className="p-4 font-bold text-slate-300 terminal-text tabular-nums">
-                      ${(item.lowPrice ?? 0).toLocaleString()}
-                    </td>
-                    <td className="p-4">
-                      <span className="bg-red-500/10 text-red-400 px-2 py-1 rounded-lg font-black border border-red-500/20">
-                        -{Math.abs(item.dropPercent)}%
-                      </span>
-                    </td>
-                    <td className="p-4 text-slate-300 leading-relaxed font-bold max-w-md">
-                      {item.reason}
-                    </td>
-                  </tr>
-                ))}
-            </tbody>
-          </table>
-        </div>
-      </div>
+      <AnimatePresence>
+        {isOpen && (
+          <motion.div
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: "auto", opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            className="overflow-hidden border-t border-slate-700 bg-slate-900/20 p-6 space-y-6"
+          >
+            <DrawdownChart drawdowns={data.historicalDrawdowns} />
+
+            <div className="bg-slate-800 rounded-2xl border border-slate-700 overflow-hidden shadow-lg">
+              <div className="overflow-x-auto custom-scrollbar">
+                <table className="w-full text-left text-sm">
+                  <thead className="bg-slate-950 text-slate-500">
+                    <tr>
+                      <th className="p-4 w-32">週期 (高點-低點)</th>
+                      <th className="p-4 w-24">高點價格</th>
+                      <th className="p-4 w-24">低點價格</th>
+                      <th className="p-4 w-20">跌幅</th>
+                      <th className="p-4">恐慌/下跌原因</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-700/50">
+                    {[...(data.historicalDrawdowns || [])]
+                      .filter((d): d is DrawdownEvent => !!d)
+                      .sort((a, b) => {
+                        const aTime = a.highDate ? new Date(a.highDate).getTime() : 0;
+                        const bTime = b.highDate ? new Date(b.highDate).getTime() : 0;
+                        return (
+                          (isNaN(bTime) ? 0 : bTime) - (isNaN(aTime) ? 0 : aTime)
+                        );
+                      })
+                      .map((item, idx) => (
+                        <tr
+                          key={idx}
+                          className="hover:bg-slate-700/30 transition-colors group"
+                        >
+                          <td className="p-4">
+                            <div className="font-bold text-emerald-400">
+                              {item.highDate}
+                            </div>
+                            <div className="text-slate-500 text-xs my-0.5">to</div>
+                            <div className="font-bold text-red-400">
+                              {item.lowDate}
+                            </div>
+                          </td>
+                          <td className="p-4 font-bold text-slate-300 terminal-text tabular-nums">
+                            ${(item.highPrice ?? 0).toLocaleString()}
+                          </td>
+                          <td className="p-4 font-bold text-slate-300 terminal-text tabular-nums">
+                            ${(item.lowPrice ?? 0).toLocaleString()}
+                          </td>
+                          <td className="p-4">
+                            <span className="bg-red-500/10 text-red-400 px-2 py-1 rounded-lg font-black border border-red-500/20">
+                              -{Math.abs(item.dropPercent)}%
+                            </span>
+                          </td>
+                          <td className="p-4 text-slate-300 leading-relaxed font-bold max-w-md">
+                            {item.reason}
+                          </td>
+                        </tr>
+                      ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   );
 };
 
-const PriceScreener = () => {
+import { getQuotaErrorMessage } from "./utils";
+
+const PriceScreener = ({
+  selectedScreenerItems = [],
+  onToggleScreenerItem = () => {},
+  isWatchlistMode = false,
+  onImportLocal = () => {},
+  onImportDrive = () => {},
+  onExportLocal = () => {},
+  onExportDrive = () => {},
+}: {
+  selectedScreenerItems?: any[];
+  onToggleScreenerItem?: (item: any) => void;
+  isWatchlistMode?: boolean;
+  onImportLocal?: () => void;
+  onImportDrive?: () => void;
+  onExportLocal?: () => void;
+  onExportDrive?: () => void;
+}) => {
   const [minPrice, setMinPrice] = useState("10");
   const [maxPrice, setMaxPrice] = useState("50");
   const [minScore, setMinScore] = useState("6");
@@ -1891,12 +2046,15 @@ const PriceScreener = () => {
   const [minValueScore, setMinValueScore] = useState("6");
   const [minCrashSimScore, setMinCrashSimScore] = useState("1");
   const [limit, setLimit] = useState("50");
-  const [screenMode, setScreenMode] = useState<"custom" | "top50" | "bottom50">(
+  const [screenMode, setScreenMode] = useState<"custom" | "top50" | "bottom50" | "defensive70" | "defensive70Tech" | "worst70Tech">(
     "custom",
   );
   const [results, setResults] = useState<ScreenerItem[]>([]);
+  const [showPromptsHelp, setShowPromptsHelp] = useState(false);
+  const [helpTab, setHelpTab] = useState<"intro" | "defensive" | "short" | "trend">("intro");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [confirmDeleteItem, setConfirmDeleteItem] = useState<ScreenerItem | null>(null);
   const [sortBy, setSortBy] = useState<
     | "default"
     | "buy"
@@ -1922,7 +2080,7 @@ const PriceScreener = () => {
   };
 
   const handleSearch = async (
-    mode: "custom" | "top50" | "bottom50" = "custom",
+    mode: "custom" | "top50" | "bottom50" | "defensive70" | "defensive70Tech" | "worst70Tech" = "custom",
   ) => {
     if (mode === "custom" && (!minPrice || !maxPrice)) {
       setError("請輸入價格範圍");
@@ -1943,6 +2101,56 @@ const PriceScreener = () => {
       } else if (mode === "bottom50") {
         prompt = `Using real-time market data from Yahoo Finance and Martin Armstrong's Socrates ECM model principles, find the TOP 50 worst performing US Stocks right now. 
         Focus on assets showing deep bearish trends, proximity to negative cycle peaks, or high "sellScores" (overbought/danger) in the Socrates model.`;
+      } else if (mode === "worst70Tech") {
+        prompt = `Using real-time market data from Yahoo Finance and Martin Armstrong's Socrates ECM model principles, find EXACTLY 70 weak/vulnerable US Stocks right now as candidates for aggressive short strategies.
+        
+        YOU MUST APPLY THESE RIGID CRITERIA TO SELECT THE 70 STOCKS:
+        1. "qualityScore" (1-10) MUST be strictly less than 3 (i.e. 1 or 2) evaluating poor/weak financial health.
+        2. "valueScore" (1-10) MUST be strictly less than 4 (i.e. 1, 2, or 3) representing overvalued or highly bloated equity.
+        3. "buyScore" (1-10) MUST be strictly less than 3 (i.e. 1 or 2) showing weak trend/buy momentum.
+        4. "crashSimilarityScore" (1-10) MUST be strictly less than 3 (i.e. 1 or 2) indicating low resilience or highly vulnerable structure to market stress/drawdowns.
+        5. Combined Socrates Metrics check:
+           - Positive Score ( calculated as: calc(aiScore) + calc(qualityScore) + calc(valueScore) + buyScore, where calc(score) = score > 5 ? score - 5 : 0 ) MUST be strictly less than 4.
+           - Negative Score ( calculated as: calc(aiScore) + calc(qualityScore) + calc(valueScore) + sellScore, where calc(score) = score < 5 ? 5 - score : 0 ) MUST be strictly greater than 8.
+           Ensure the simulated/estimated scores you return satisfy these thresholds.
+        6. Technical Pattern Confirmation: EACH stock MUST strictly correspond to EXACTLY ONE of the following technical breakdown/distribution patterns based on latest chart geometry, and you MUST return this matched form in the "technicalPattern" field:
+           - "M型頂"
+           - "三重頂"
+           - "頭肩頂"
+           - "圓弧頂"
+           - "喇叭頂"
+           - "看跌旗形"
+           - "看跌對稱三角形"
+           - "看跌持續菱形"
+           - "看跌持續楔形"
+           - "看跌持續三角形"`;
+      } else if (mode === "defensive70" || mode === "defensive70Tech") {
+        const withPatterns = mode === "defensive70Tech" ? `
+        7. Technical Pattern Confirmation: EACH stock MUST strictly correspond to EXACTLY ONE of the following technical rebound/consolidation patterns based on latest chart geometry, and you MUST return this matched form in the "technicalPattern" field:
+           - "W型底"
+           - "三重底"
+           - "頭肩底"
+           - "圓弧底"
+           - "喇叭底"
+           - "看漲旗形"
+           - "看漲對稱三角形"
+           - "看漲持續菱形"
+           - "看漲持續楔形"
+           - "看漲持續三角形"` : "";
+
+        prompt = `Using real-time market data from Yahoo Finance and Martin Armstrong's Socrates ECM model principles, find EXACTLY 70 defensive US Stocks right now.
+        We are looking for top-tier low-drawdown, highly resilient assets with robust financial health, pristine value alignment, and key technical/cycle support configurations.
+
+        YOU MUST APPLY THESE RIGID CRITERIA TO SELECT THE 70 STOCKS:
+        1. "qualityScore" (1-10) MUST be strictly greater than 7 (i.e. 8, 9, or 10) evaluating top financial health.
+        2. "valueScore" (1-10) MUST be strictly greater than 7 (i.e. 8, 9, or 10) representing beautiful undervalued or fair-priced entry points.
+        3. "buyScore" (1-10) MUST be strictly greater than 4 (i.e. 5, 6, 7, 8, 9, or 10) showing solid technical momentum/buy strength.
+        4. "crashSimilarityScore" (1-10) MUST be strictly greater than 6 (i.e. 7, 8, 9, or 10) indicating very clear historical crash/drawdown resilience.
+        5. Proximity to Technical Support: We want the stock currently trading very close to its technical support price. Specifically, the stock's current price must be approximately 1.5% to 2.0% above its estimated "supportPrice". You MUST specify a "supportPrice" for each stock such that (price - supportPrice) / supportPrice is mathematically between 0.015 and 0.020 (1.5% to 2.0%).
+        6. Combined Socrates Metrics check:
+           - Positive Score ( calculated in code as: calc(aiScore) + calc(qualityScore) + calc(valueScore) + buyScore, where calc(score) = score > 5 ? score - 5 : 0 ) MUST be strictly greater than 4.
+           - Negative Score ( calculated in code as: calc(aiScore) + calc(qualityScore) + calc(valueScore) + sellScore, where calc(score) = score < 5 ? 5 - score : 0 ) MUST be strictly less than 5.
+           Ensure the simulated/estimated scores you return satisfy these thresholds.${withPatterns}`;
       } else {
         prompt = `Find approximately ${limit} US Stocks that are currently trading between $${minPrice} and $${maxPrice} USD using Yahoo Finance data.
         IMPORTANT: Only include assets that you estimate would have a Screener AI Score (1-10) of AT LEAST ${minScore}/10 right now, a Socrates ECM "buyScore" (1-10) of AT LEAST ${minBuyScore}/10 right now, a "sellScore" (1-10) of AT LEAST ${minSellScore}/10, a Quality Score of AT LEAST ${minQualityScore}/10, a Value Score of AT LEAST ${minValueScore}/10, and a Crash Similarity Score of AT LEAST ${minCrashSimScore}/10.`;
@@ -1953,7 +2161,8 @@ const PriceScreener = () => {
       Use Google Search to fetch the MOST RECENT and EXACT price for EACH of the selected assets on Yahoo Finance today. Do not hallucinate or use outdated prices.
 
       CRITICAL INSTRUCTION: For EACH resulting asset, you MUST estimate a "buyScore" (1-10) and "sellScore" (1-10) based on Martin Armstrong's ECM model principles (e.g., proximity to cycle lows/highs, recent trends). Also provide a brief "ecmStatus" indicating the current status. Include "aiScore" (1-10) as a general AI rating, "qualityScore" (1-10) and "valueScore" (1-10). Additionally, include a "crashSimilarityScore" (1-10) evaluating the similarity between the recent drawdown and the 2 most recent major historical drawdowns over the past 5 years.
-      IMPORTANT: The "ecmStatus" field MUST be written in Traditional Chinese (繁體中文), e.g., "接近週期低點", "超買", "中性發展".
+      Also provide "supportPrice" representing the estimated technical support price for the asset (ensure that for the defensive70/defensive70Tech modes, the current price is exactly 1.5% to 2% above this supportPrice).
+      IMPORTANT: The "ecmStatus" field MUST be written in Traditional Chinese (繁體中文), e.g., "接近週期低點且獲強支撐", "多頭防禦成形", "雙重重疊支撐".
       
       Return the response strictly as a JSON array of objects with the following structure:
       [
@@ -1967,8 +2176,10 @@ const PriceScreener = () => {
           "sellScore": 2,
           "qualityScore": 8,
           "valueScore": 7,
-          "crashSimilarityScore": 5,
-          "ecmStatus": "接近潛在週期底部"
+          "crashSimilarityScore": 7,
+          "supportPrice": 147.50,
+          "ecmStatus": "強力支撐之上1.7%盤整，多頭防禦特徵顯著",
+          "technicalPattern": "W型底"
         },
         ...
       ]
@@ -2018,18 +2229,18 @@ const PriceScreener = () => {
         }
         setResults(data);
       } else {
-        throw new Error("格式錯誤");
+        throw new Error("回應格式錯誤 (非陣列)");
       }
     } catch (err: any) {
       console.error(err);
-      setError(err.message || "搜尋失敗，請稍後再試");
+      setError(getQuotaErrorMessage(err.message || err.toString()));
     } finally {
       setLoading(false);
     }
   };
 
   const sortedResults = useMemo(() => {
-    const items = [...results];
+    const items = isWatchlistMode ? [...selectedScreenerItems] : [...results];
     if (sortBy === "buy") {
       return items.sort((a, b) => (b.buyScore || 0) - (a.buyScore || 0));
     }
@@ -2056,21 +2267,69 @@ const PriceScreener = () => {
       return items.sort((a, b) => getNegScore(b) - getNegScore(a));
     }
     return items;
-  }, [results, sortBy]);
+  }, [results, sortBy, isWatchlistMode, selectedScreenerItems]);
 
   return (
     <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500">
-      <div className="bg-slate-800 p-6 md:p-8 rounded-3xl border border-slate-700 shadow-xl">
-        <div className="flex flex-col md:flex-row md:items-center justify-between mb-6 gap-4">
-          <h3 className="text-xl font-black text-white flex items-center gap-3">
+      {!isWatchlistMode && (
+        <div className="bg-slate-800 p-4 md:px-8 md:py-5 rounded-2xl border border-slate-700 shadow-xl">
+          <div className="flex flex-col md:flex-row md:items-center justify-between mb-4 gap-4">
+            <h3 className="text-xl font-black text-white flex items-center gap-2">
             <Filter className="w-6 h-6 text-amber-500" />
-            Socrates 智能篩選器
+            <span>Socrates 智能篩選器</span>
+            <button
+              onClick={() => setShowPromptsHelp(true)}
+              className="p-1 rounded-lg text-slate-400 hover:text-amber-400 hover:bg-slate-700/50 transition-all flex items-center justify-center"
+              title="查看智能篩選器規則與 Prompt 說明"
+              type="button"
+            >
+              <HelpCircle className="w-5 h-5" />
+            </button>
           </h3>
-          <div className="flex gap-2">
+          <div className="flex flex-wrap gap-2">
+            <button
+              id="btn-defensive-70"
+              onClick={() => handleSearch("defensive70")}
+              disabled={loading}
+              className={`px-3 py-1.5 rounded-lg text-xs font-black transition-all border flex items-center gap-2 ${
+                screenMode === "defensive70"
+                  ? "bg-blue-600 border-blue-400 text-white shadow-[0_2px_10px_rgba(37,99,235,0.2)]"
+                  : "bg-slate-900 border-slate-700 text-blue-400 hover:border-blue-500"
+              }`}
+              title="品質評分 > 7、價值評分 > 7、買入評分 > 4、崩盤相似度 > 6、Pos評分 > 4、Neg評分 < 5，且離目前最新價位靠近技術分析支撐價格約 1.5~2% 左右。"
+            >
+              <ShieldCheck className="w-4 h-4" /> 🛡️ 防禦型前70
+            </button>
+            <button
+              id="btn-defensive-70-tech"
+              onClick={() => handleSearch("defensive70Tech")}
+              disabled={loading}
+              className={`px-3 py-1.5 rounded-lg text-xs font-black transition-all border flex items-center gap-2 ${
+                screenMode === "defensive70Tech"
+                  ? "bg-indigo-600 border-indigo-400 text-white shadow-[0_2px_10px_rgba(79,70,229,0.2)] animate-pulse"
+                  : "bg-slate-900 border-slate-700 text-indigo-400 hover:border-indigo-500"
+              }`}
+              title="品質評分 > 7、價值評分 > 7、買入評分 > 4、崩盤相似度 > 6、Pos評分 > 4、Neg評分 < 5，離最新價靠近支撐價格 1.5~2% 左右，且符合看漲技術形態（如W型底、三重底等二維特徵形態確認）。"
+            >
+              <ShieldCheck className="w-4 h-4 text-amber-400" /> 🛡️ 防禦型前70 + 技術確認
+            </button>
+            <button
+              id="btn-worst-70-tech"
+              onClick={() => handleSearch("worst70Tech")}
+              disabled={loading}
+              className={`px-3 py-1.5 rounded-lg text-xs font-black transition-all border flex items-center gap-2 ${
+                screenMode === "worst70Tech"
+                  ? "bg-rose-600 border-rose-400 text-white shadow-[0_2px_10px_rgba(225,29,72,0.2)] animate-pulse"
+                  : "bg-slate-900 border-slate-700 text-rose-400 hover:border-rose-500"
+              }`}
+              title="品質評分 < 3、價值評分 < 4、買入評分 < 3、崩盤相似度 < 3、Pos評分 < 4、Neg評分 > 8，且符合看跌技術狀態（如M型頂、三重頂等二維特徵型態確認）。"
+            >
+              <ShieldAlert className="w-4 h-4 text-rose-400 animate-bounce" /> ⚔️ 猛攻最弱前70 + 技術確認
+            </button>
             <button
               onClick={() => handleSearch("top50")}
               disabled={loading}
-              className={`px-4 py-2 rounded-xl text-xs font-black transition-all border flex items-center gap-2 ${
+              className={`px-3 py-1.5 rounded-lg text-xs font-black transition-all border flex items-center gap-2 ${
                 screenMode === "top50"
                   ? "bg-emerald-600 border-emerald-400 text-white"
                   : "bg-slate-900 border-slate-700 text-emerald-500 hover:border-emerald-500"
@@ -2081,7 +2340,7 @@ const PriceScreener = () => {
             <button
               onClick={() => handleSearch("bottom50")}
               disabled={loading}
-              className={`px-4 py-2 rounded-xl text-xs font-black transition-all border flex items-center gap-2 ${
+              className={`px-3 py-1.5 rounded-lg text-xs font-black transition-all border flex items-center gap-2 ${
                 screenMode === "bottom50"
                   ? "bg-red-600 border-red-400 text-white"
                   : "bg-slate-900 border-slate-700 text-red-500 hover:border-red-500"
@@ -2091,7 +2350,7 @@ const PriceScreener = () => {
             </button>
             <button
               onClick={() => setScreenMode("custom")}
-              className={`px-4 py-2 rounded-xl text-xs font-black transition-all border ${
+              className={`px-3 py-1.5 rounded-lg text-xs font-black transition-all border ${
                 screenMode === "custom"
                   ? "bg-amber-600 border-amber-400 text-white"
                   : "bg-slate-900 border-slate-700 text-amber-500 hover:border-amber-500"
@@ -2103,9 +2362,9 @@ const PriceScreener = () => {
         </div>
 
         {screenMode === "custom" ? (
-          <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-4 items-end animate-in fade-in slide-in-from-top-2 duration-300">
+          <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-3.5 items-end animate-in fade-in slide-in-from-top-2 duration-300">
             <div>
-              <label className="block text-xs font-bold text-slate-500 mb-2 uppercase">
+              <label className="block text-xs font-bold text-slate-500 mb-1 uppercase">
                 價格 (起)
               </label>
               <div className="relative">
@@ -2116,13 +2375,13 @@ const PriceScreener = () => {
                   type="number"
                   value={minPrice}
                   onChange={(e) => setMinPrice(e.target.value)}
-                  className="w-full bg-slate-900 border border-slate-700 rounded-xl pl-6 pr-3 py-2 text-sm text-white font-mono font-bold outline-none focus:border-amber-500"
+                  className="w-full bg-slate-900 border border-slate-700 rounded-lg pl-6 pr-3 py-1.5 text-xs text-white font-mono font-bold outline-none focus:border-amber-500"
                 />
               </div>
             </div>
 
             <div>
-              <label className="block text-xs font-bold text-slate-500 mb-2 uppercase">
+              <label className="block text-xs font-bold text-slate-500 mb-1 uppercase">
                 價格 (迄)
               </label>
               <div className="relative">
@@ -2133,14 +2392,14 @@ const PriceScreener = () => {
                   type="number"
                   value={maxPrice}
                   onChange={(e) => setMaxPrice(e.target.value)}
-                  className="w-full bg-slate-900 border border-slate-700 rounded-xl pl-6 pr-3 py-2 text-sm text-white font-mono font-bold outline-none focus:border-amber-500"
+                  className="w-full bg-slate-900 border border-slate-700 rounded-lg pl-6 pr-3 py-1.5 text-xs text-white font-mono font-bold outline-none focus:border-amber-500"
                 />
               </div>
             </div>
 
             <div>
               <label
-                className="block text-xs font-bold text-sky-500/80 mb-2 uppercase"
+                className="block text-xs font-bold text-sky-500/80 mb-1 uppercase"
                 title="Minimum AI Score"
               >
                 最低 AI 分
@@ -2148,7 +2407,7 @@ const PriceScreener = () => {
               <select
                 value={minScore}
                 onChange={(e) => setMinScore(e.target.value)}
-                className="w-full bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-sm text-white font-bold outline-none focus:border-sky-500"
+                className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-white font-bold outline-none focus:border-sky-500"
               >
                 {[1, 2, 3, 4, 5, 6, 7, 8, 9].map((num) => (
                   <option key={num} value={num.toString()}>
@@ -2160,7 +2419,7 @@ const PriceScreener = () => {
 
             <div>
               <label
-                className="block text-xs font-bold text-emerald-500/80 mb-2 uppercase"
+                className="block text-xs font-bold text-emerald-500/80 mb-1 uppercase"
                 title="Minimum Buy Score"
               >
                 最低 Buy Score
@@ -2168,7 +2427,7 @@ const PriceScreener = () => {
               <select
                 value={minBuyScore}
                 onChange={(e) => setMinBuyScore(e.target.value)}
-                className="w-full bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-sm text-white font-bold outline-none focus:border-emerald-500"
+                className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-white font-bold outline-none focus:border-emerald-500"
               >
                 {[0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map((num) => (
                   <option key={num} value={num.toString()}>
@@ -2180,7 +2439,7 @@ const PriceScreener = () => {
 
             <div>
               <label
-                className="block text-xs font-bold text-rose-500/80 mb-2 uppercase"
+                className="block text-xs font-bold text-rose-500/80 mb-1 uppercase"
                 title="Minimum Sell Score"
               >
                 最低 Sell Score
@@ -2188,7 +2447,7 @@ const PriceScreener = () => {
               <select
                 value={minSellScore}
                 onChange={(e) => setMinSellScore(e.target.value)}
-                className="w-full bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-sm text-white font-bold outline-none focus:border-rose-500"
+                className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-white font-bold outline-none focus:border-rose-500"
               >
                 {[0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map((num) => (
                   <option key={num} value={num.toString()}>
@@ -2199,13 +2458,13 @@ const PriceScreener = () => {
             </div>
 
             <div>
-              <label className="block text-xs font-bold text-blue-500/80 mb-2 uppercase">
+              <label className="block text-xs font-bold text-blue-500/80 mb-1 uppercase">
                 最低 Quality
               </label>
               <select
                 value={minQualityScore}
                 onChange={(e) => setMinQualityScore(e.target.value)}
-                className="w-full bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-sm text-white font-bold outline-none focus:border-blue-500"
+                className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-white font-bold outline-none focus:border-blue-500"
               >
                 {[1, 2, 3, 4, 5, 6, 7, 8, 9].map((num) => (
                   <option key={num} value={num.toString()}>
@@ -2216,13 +2475,13 @@ const PriceScreener = () => {
             </div>
 
             <div>
-              <label className="block text-xs font-bold text-purple-500/80 mb-2 uppercase">
+              <label className="block text-xs font-bold text-purple-500/80 mb-1 uppercase">
                 最低 Value
               </label>
               <select
                 value={minValueScore}
                 onChange={(e) => setMinValueScore(e.target.value)}
-                className="w-full bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-sm text-white font-bold outline-none focus:border-purple-500"
+                className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-white font-bold outline-none focus:border-purple-500"
               >
                 {[1, 2, 3, 4, 5, 6, 7, 8, 9].map((num) => (
                   <option key={num} value={num.toString()}>
@@ -2233,13 +2492,13 @@ const PriceScreener = () => {
             </div>
 
             <div>
-              <label className="block text-xs font-bold text-amber-500/80 mb-2 uppercase whitespace-nowrap">
+              <label className="block text-xs font-bold text-amber-500/80 mb-1 uppercase whitespace-nowrap">
                 崩盤相似度 (低-高)
               </label>
               <select
                 value={minCrashSimScore}
                 onChange={(e) => setMinCrashSimScore(e.target.value)}
-                className="w-full bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-sm text-white font-bold outline-none focus:border-amber-500"
+                className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-white font-bold outline-none focus:border-amber-500"
               >
                 {[1, 2, 3, 4, 5, 6, 7, 8, 9].map((num) => (
                   <option key={num} value={num.toString()}>
@@ -2250,13 +2509,13 @@ const PriceScreener = () => {
             </div>
 
             <div>
-              <label className="block text-xs font-bold text-slate-500 mb-2 uppercase">
+              <label className="block text-xs font-bold text-slate-500 mb-1 uppercase">
                 數量
               </label>
               <select
                 value={limit}
                 onChange={(e) => setLimit(e.target.value)}
-                className="w-full bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-sm text-white font-bold outline-none focus:border-amber-500"
+                className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-white font-bold outline-none focus:border-amber-500"
               >
                 <option value="50">50</option>
                 <option value="100">100</option>
@@ -2268,7 +2527,7 @@ const PriceScreener = () => {
             <button
               onClick={() => handleSearch("custom")}
               disabled={loading}
-              className="col-span-2 sm:col-span-1 bg-amber-600 hover:bg-amber-500 text-white font-black py-2 rounded-xl transition-colors flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed h-[38px]"
+              className="col-span-2 sm:col-span-1 bg-amber-600 hover:bg-amber-500 text-white font-black py-1.5 rounded-lg text-xs transition-colors flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed h-[32px]"
             >
               {loading ? (
                 <Loader2 className="w-4 h-4 animate-spin" />
@@ -2279,37 +2538,76 @@ const PriceScreener = () => {
             </button>
           </div>
         ) : (
-          <div className="bg-slate-900/50 p-4 rounded-2xl border border-slate-700/50 text-center animate-in zoom-in-95 duration-300">
-            <p className="text-slate-400 font-medium">
-              正在透過 Socrates ECM 模型分析市場中的{" "}
-              {screenMode === "top50" ? "最佳" : "最差"} 50 名表現者...
-            </p>
+          <div className="bg-slate-900/50 p-4 rounded-2xl border border-slate-700/50 animate-in zoom-in-95 duration-300">
+            <div className="text-slate-400 font-medium font-sans">
+              {error ? (
+                <span className="flex items-center justify-center gap-2 text-rose-500 font-bold">
+                  <AlertTriangle className="w-4 h-4" />
+                  {getQuotaErrorMessage(error)}
+                </span>
+              ) : loading ? (
+                <span className="flex items-center justify-center gap-2">
+                  <Loader2 className="w-4 h-4 animate-spin text-amber-500" />
+                  正在透過 Socrates ECM 模型分析市場中的{" "}
+                  {screenMode === "top50" ? "最強 50 名" : screenMode === "bottom50" ? "最弱 50 名" : screenMode === "defensive70Tech" ? "防禦型前 70 名 + 技術型態確認" : screenMode === "worst70Tech" ? "猛攻最弱前 70 名 + 技術型態確認" : "防禦型前 70 名"} 表現者...
+                </span>
+              ) : (
+                <span className="flex flex-col sm:flex-row items-center justify-between gap-3 text-left">
+                  <span className="flex items-center gap-2 text-xs font-bold text-slate-200">
+                    <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+                    已成功載入篩選：
+                    <span className="text-amber-500">
+                      {screenMode === "top50" ? "最強 50 名" : screenMode === "bottom50" ? "最弱 50 名" : screenMode === "defensive70Tech" ? "防禦型前 70 名 + 技術型態確認" : screenMode === "worst70Tech" ? "猛攻最弱前 70 名 + 技術型態確認" : "防禦型前 70 名"}
+                    </span>
+                    （共 {results.length} 檔標的）
+                  </span>
+                  <button
+                    onClick={() => {
+                      setScreenMode("custom");
+                    }}
+                    className="text-[10px] text-amber-500 hover:text-amber-400 font-black border border-amber-500/30 px-3 py-1.5 rounded-md bg-amber-500/5 hover:bg-amber-500/10 transition-all cursor-pointer"
+                  >
+                    重置並切換為自定義篩選
+                  </button>
+                </span>
+              )}
+            </div>
           </div>
         )}
       </div>
+      )}
 
-      {error && (
+      {error && !isWatchlistMode && (
         <div className="bg-red-900/10 border border-red-500/30 p-4 rounded-2xl text-red-400 flex items-center gap-3">
           <AlertTriangle className="w-5 h-5" />
           <span className="font-bold">{error}</span>
         </div>
       )}
 
-      {results.length > 0 && (
+      {(isWatchlistMode ? selectedScreenerItems.length > 0 : results.length > 0) && (
         <div className="bg-slate-800 rounded-3xl border border-slate-700 overflow-hidden shadow-xl">
           <div className="p-4 bg-slate-900 border-b border-slate-700 flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
             <div className="flex items-center gap-4">
               <span className="font-black text-sm uppercase tracking-widest text-white flex items-center gap-2">
-                <List className="w-5 h-5 text-amber-500" /> 搜尋結果 (
-                {results.length})
+                <List className="w-5 h-5 text-amber-500" /> {isWatchlistMode ? "精選名單" : "搜尋結果"} (
+                {isWatchlistMode ? selectedScreenerItems.length : results.length})
               </span>
               <button
-                onClick={handleExportJson}
+                onClick={isWatchlistMode ? onExportLocal : handleExportJson}
                 className="flex items-center gap-2 px-3 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg text-[11px] font-black text-slate-400 hover:text-white transition-all group"
               >
                 <Download className="w-3.5 h-3.5 text-amber-500 group-hover:scale-110 transition-transform" />
                 匯出 JSON
               </button>
+              {isWatchlistMode && (
+                <button
+                  onClick={onImportLocal}
+                  className="flex items-center gap-2 px-3 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg text-[11px] font-black text-slate-400 hover:text-white transition-all group"
+                >
+                  <CloudUpload className="w-3.5 h-3.5 text-emerald-500 group-hover:scale-110 transition-transform" />
+                  匯入 JSON
+                </button>
+              )}
             </div>
             <div className="flex bg-slate-800 p-1 rounded-lg border border-slate-700 overflow-x-auto custom-scrollbar whitespace-nowrap">
               <button
@@ -2363,146 +2661,399 @@ const PriceScreener = () => {
             </div>
           </div>
           <div className="overflow-x-auto custom-scrollbar max-h-[600px]">
-            <table className="w-full text-left text-sm">
-              <thead className="bg-slate-950 text-slate-500 sticky top-0 z-10">
+            <table className="w-full text-left text-[13px] whitespace-nowrap">
+              <thead className="bg-slate-950 text-slate-500 sticky top-0 z-10 border-b border-slate-800">
                 <tr>
-                  <th className="p-4 w-24">代號</th>
-                  <th className="p-4">名稱</th>
-                  <th className="p-4 w-28">價格 (USD)</th>
-                  <th className="p-4 min-w-[450px]">Socrates 評分</th>
-                  <th className="p-4">週期狀態/簡評</th>
+                  <th className="p-4 w-32 font-bold tracking-wider">代碼</th>
+                  <th className="p-4 font-bold tracking-wider">名稱</th>
+                  <th className="p-4 w-28 text-right font-bold tracking-wider">現價</th>
+                  <th className="p-4 text-center font-bold tracking-wider text-fuchsia-500">AI分析</th>
+                  <th className="p-4 text-center font-bold tracking-wider text-emerald-500">BUY</th>
+                  <th className="p-4 text-center font-bold tracking-wider text-rose-500">SELL ↓</th>
+                  <th className="p-4 text-center font-bold tracking-wider text-sky-500">風險</th>
+                  <th className="p-4 text-center font-bold tracking-wider text-slate-400">QUAL</th>
+                  <th className="p-4 text-center font-bold tracking-wider text-slate-400">VAL</th>
+                  <th className="p-4 text-center font-bold tracking-wider text-emerald-600">POS VAL</th>
+                  <th className="p-4 text-center font-bold tracking-wider text-rose-600">NEG VAL</th>
+                  <th className="p-4 max-w-[200px] font-bold tracking-wider">訊號解讀</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-800">
-                {sortedResults.map((item, idx) => (
+                {sortedResults.map((item, idx) => {
+                  const isSelected = selectedScreenerItems?.some(i => i.symbol === item.symbol) || false;
+                  return (
                   <tr
                     key={idx}
-                    className="hover:bg-slate-800/40 transition-all group border-l-4 border-l-transparent hover:border-l-amber-500"
+                    className={`transition-all group border-l-4 border-l-transparent hover:border-l-amber-500 ${isSelected ? 'bg-amber-900/20 hover:bg-amber-900/30' : 'hover:bg-slate-800/40'}`}
                   >
-                    <td className="p-4 font-black text-white group-hover:text-amber-500 transition-colors terminal-text uppercase tracking-tighter">
-                      {item.symbol}
-                    </td>
-                    <td className="p-4 text-slate-300 font-bold">
-                      {item.name}
-                      <div className="text-[10px] text-slate-500 font-black uppercase tracking-widest mt-1">
-                        {item.sector || "-"}
-                      </div>
-                    </td>
-                    <td className="p-4 font-black text-amber-500 terminal-text">
-                      <div className="flex flex-col">
-                        <span>${item.price?.toLocaleString()}</span>
-                        <span className="text-[8px] text-emerald-500/70 terminal-text">
-                          LIVE • YAHOO
-                        </span>
-                      </div>
-                    </td>
-                    <td className="p-4">
-                      <div className="flex gap-2">
-                        <div className="flex flex-col items-center gap-1">
-                          <ScoreCircle score={item.aiScore ?? 5} type="ai" />
-                          <span className="text-[9px] text-sky-500 font-black uppercase tracking-tighter">
-                            AI
-                          </span>
-                        </div>
-                        <div className="flex flex-col items-center gap-1">
-                          <ScoreCircle score={item.buyScore || 0} type="buy" />
-                          <span className="text-[9px] text-emerald-500 font-black uppercase tracking-tighter">
-                            Buy
-                          </span>
-                        </div>
-                        <div className="flex flex-col items-center gap-1">
-                          <ScoreCircle
-                            score={item.sellScore || 0}
-                            type="sell"
-                          />
-                          <span className="text-[9px] text-rose-500 font-black uppercase tracking-tighter">
-                            Sell
-                          </span>
-                        </div>
-                        <div className="flex flex-col items-center gap-1">
-                          <ScoreCircle
-                            score={item.qualityScore || 0}
-                            type="quality"
-                          />
-                          <span className="text-[9px] text-blue-500 font-black uppercase tracking-tighter">
-                            Qual
-                          </span>
-                        </div>
-                        <div className="flex flex-col items-center gap-1">
-                          <ScoreCircle
-                            score={item.valueScore || 0}
-                            type="value"
-                          />
-                          <span className="text-[9px] text-purple-500 font-black uppercase tracking-tighter">
-                            Val
-                          </span>
-                        </div>
-                        <div
-                          className="flex flex-col items-center gap-1 relative group"
-                          title="最近2次歷史崩盤相似度 (1-10)"
-                        >
-                          <ScoreCircle
-                            score={item.crashSimilarityScore || 0}
-                            type="crashSim"
-                          />
-                          <span className="text-[9px] text-amber-500 font-black uppercase tracking-tighter whitespace-nowrap">
-                            Crash
-                          </span>
-                        </div>
-
-                        <div className="flex flex-col items-center justify-center bg-emerald-950/20 p-1.5 rounded-xl border border-emerald-500/20 min-w-[52px] h-[48px] shadow-inner shrink-0 mt-0.5 ml-2">
-                          <span className="text-[8px] font-black text-emerald-500/70 uppercase tracking-widest mb-1 pointer-events-none whitespace-nowrap">
-                            Pos.
-                          </span>
-                          <div className="flex items-baseline gap-0.5">
-                            <span className="text-base font-black terminal-text text-emerald-400">
-                              +{getPosScore(item)}
-                            </span>
-                          </div>
-                        </div>
-
-                        <div className="flex flex-col items-center justify-center bg-rose-950/20 p-1.5 rounded-xl border border-rose-500/20 min-w-[52px] h-[48px] shadow-inner shrink-0 mt-0.5 ml-1">
-                          <span className="text-[8px] font-black text-rose-500/70 uppercase tracking-widest mb-1 pointer-events-none whitespace-nowrap">
-                            Neg.
-                          </span>
-                          <div className="flex items-baseline gap-0.5">
-                            <span className="text-base font-black terminal-text text-rose-400">
-                              +{getNegScore(item)}
-                            </span>
-                          </div>
-                        </div>
-                      </div>
-                    </td>
-                    <td className="p-4">
-                      <div className="flex items-center gap-2 max-w-xs">
-                        {item.ecmStatus?.toLowerCase().includes("danger") ||
-                        (item.sellScore || 0) > 7 ? (
-                          <AlertTriangle className="w-4 h-4 text-rose-500 animate-pulse" />
-                        ) : (item.buyScore || 0) > 7 ? (
-                          <TrendingUp className="w-4 h-4 text-emerald-500" />
-                        ) : (
-                          <Activity className="w-4 h-4 text-slate-600" />
+                    <td className="p-4 font-black">
+                      <div className="flex items-center gap-2.5 sm:gap-3">
+                        <input type="checkbox" checked={isSelected} onChange={() => onToggleScreenerItem?.(item)} className="w-3.5 h-3.5 flex-shrink-0 cursor-pointer accent-amber-500 rounded-sm" title={isSelected ? "取消勾選" : "勾選"} />
+                        <button onClick={() => navigator.clipboard.writeText(JSON.stringify(item))} className="text-slate-500 hover:text-sky-400 flex-shrink-0 transition-colors" title="複製此列 JSON"><Copy className="w-3.5 h-3.5" /></button>
+                        {isWatchlistMode && (
+                          <button onClick={() => setConfirmDeleteItem(item)} className="text-slate-500 hover:text-rose-500 flex-shrink-0 transition-colors" title="自精選名單移除"><Trash2 className="w-3.5 h-3.5" /></button>
                         )}
-                        <span
-                          className={`text-[13px] font-bold leading-tight ${
-                            (item.buyScore || 0) > 7
-                              ? "text-emerald-400"
-                              : (item.sellScore || 0) > 7
-                                ? "text-rose-400"
-                                : "text-slate-400"
-                          }`}
-                        >
-                          {item.ecmStatus || "分析中..."}
-                        </span>
+                        <span className="text-white group-hover:text-amber-500 transition-colors terminal-text uppercase tracking-tighter text-sm">{item.symbol}</span>
+                      </div>
+                    </td>
+                    <td className="p-4 text-slate-300 font-bold whitespace-nowrap">
+                      <div>{item.name || "-"}</div>
+                      <div className="flex items-center gap-1.5 mt-1">
+                        <span className="text-[9px] text-slate-500 font-black uppercase tracking-widest">{item.sector || "-"}</span>
+                        {item.technicalPattern && (
+                          <span className={`px-1.5 py-0.5 rounded-md text-[9px] font-black tracking-wider whitespace-nowrap ${
+                            item.technicalPattern.includes("頂") || item.technicalPattern.includes("看跌") || item.technicalPattern.includes("M")
+                              ? "bg-rose-950/65 text-rose-300 border border-rose-500/30"
+                              : "bg-indigo-900/65 text-indigo-300 border border-indigo-500/30"
+                          }`}>
+                            {item.technicalPattern.includes("頂") || item.technicalPattern.includes("看跌") || item.technicalPattern.includes("M") ? '📉' : '📈'} {item.technicalPattern}
+                          </span>
+                        )}
+                      </div>
+                    </td>
+                    <td className="p-4 text-right font-black text-amber-500 terminal-text whitespace-nowrap">
+                      <div className="flex flex-col items-end">
+                        <span className="text-sm">${item.price?.toLocaleString() || "-"}</span>
+                        {item.supportPrice && item.supportPrice > 0 && (
+                          <div className="flex flex-col items-end mt-0.5 leading-tight">
+                            <span className="text-[10px] text-sky-400">支撐: ${item.supportPrice?.toLocaleString()}</span>
+                            <span className="text-[9px] text-slate-400 font-medium">距支撐: {(((item.price - item.supportPrice) / item.supportPrice) * 100).toFixed(2)}%</span>
+                          </div>
+                        )}
+                      </div>
+                    </td>
+                    <td className="p-4 text-center font-bold text-fuchsia-400 terminal-text">{item.aiScore ?? 5}</td>
+                    <td className="p-4 text-center font-bold text-emerald-400 terminal-text">{item.buyScore || 0}</td>
+                    <td className="p-4 text-center font-bold text-rose-400 terminal-text">{item.sellScore || 0}</td>
+                    <td className="p-4 text-center font-bold text-sky-400 terminal-text">{item.crashSimilarityScore || 0}</td>
+                    <td className="p-4 text-center font-bold text-blue-400 terminal-text">{item.qualityScore || 0}</td>
+                    <td className="p-4 text-center font-bold text-purple-400 terminal-text">{item.valueScore || 0}</td>
+                    <td className="p-4 text-center font-bold text-emerald-500 terminal-text">{getPosScore(item)}</td>
+                    <td className="p-4 text-center font-bold text-rose-500 terminal-text">{getNegScore(item)}</td>
+                    <td className="p-4 font-bold max-w-[200px]">
+                      <div className="bg-slate-900 border border-slate-700/50 rounded-lg px-2.5 py-1.5 truncate text-xs text-slate-300 w-full hover:overflow-visible hover:whitespace-normal hover:z-50 hover:relative" title={item.ecmStatus || "分析中..."}>
+                         {item.ecmStatus || "分析中..."}
                       </div>
                     </td>
                   </tr>
-                ))}
+                  );
+                })}
               </tbody>
             </table>
           </div>
         </div>
       )}
+
+      {isWatchlistMode && selectedScreenerItems.length === 0 && (
+        <div className="bg-slate-800 p-8 md:p-12 rounded-3xl border border-slate-700 text-center space-y-6 max-w-lg mx-auto shadow-xl animate-in fade-in zoom-in-95 duration-300">
+          <div className="p-4 bg-amber-500/10 text-amber-500 rounded-full w-16 h-16 mx-auto flex items-center justify-center">
+            <List className="w-8 h-8" />
+          </div>
+          <div className="space-y-2">
+            <h3 className="text-xl font-bold text-slate-200">精選名單目前為空 📃</h3>
+            <p className="text-sm text-slate-400 leading-relaxed">
+              您尚未在精選名單中添加任何個股。
+              請先切換至「篩選器」進行選股分析，並在篩選結果中勾選加入；
+              或者您也可以使用下方的「匯入 JSON」按鈕載入先前的備份檔案。
+            </p>
+          </div>
+          <div className="pt-2 flex justify-center">
+            <button
+              onClick={onImportLocal}
+              className="px-4 py-2 bg-gradient-to-r from-amber-600 to-amber-500 hover:from-amber-500 hover:to-amber-400 text-white font-black rounded-xl text-xs transition-colors flex items-center gap-2 shadow-lg shadow-amber-950/20 cursor-pointer"
+            >
+              <CloudUpload className="w-4 h-4 text-white" /> 匯入先前備份 (.json)
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Remove Item Confirmation Modal */}
+      <AnimatePresence>
+        {confirmDeleteItem && (
+          <div className="fixed inset-0 z-[250] flex items-center justify-center p-4">
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setConfirmDeleteItem(null)}
+              className="absolute inset-0 bg-black/80 backdrop-blur-sm"
+            />
+            <motion.div
+              initial={{ opacity: 0, scale: 0.95 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.95 }}
+              className="relative bg-slate-900 border border-slate-700 p-6 rounded-2xl shadow-2xl max-w-sm w-full z-[260]"
+            >
+              <h4 className="text-base font-black text-white mb-2 flex items-center gap-1.5">
+                <Trash2 className="w-5 h-5 text-rose-500 animate-pulse" />
+                確認移除
+              </h4>
+              <p className="text-xs text-slate-300 mb-6 font-medium leading-relaxed">
+                確定要將 「<span className="text-amber-500 font-mono font-bold">{confirmDeleteItem.symbol}</span>」 從精選名單中移除嗎？
+              </p>
+              <div className="flex justify-end gap-3">
+                <button
+                  onClick={() => setConfirmDeleteItem(null)}
+                  className="px-4 py-2 rounded-lg text-xs font-bold text-slate-400 hover:bg-slate-800 transition-colors"
+                >
+                  取消
+                </button>
+                <button
+                  onClick={() => {
+                    onToggleScreenerItem?.(confirmDeleteItem);
+                    setConfirmDeleteItem(null);
+                  }}
+                  className="px-4 py-2 rounded-lg text-xs font-bold bg-rose-600 hover:bg-rose-500 text-white transition-colors shadow-lg shadow-rose-900/20"
+                >
+                  確認移除
+                </button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* Socrates Prompts Explanation Dialog */}
+      <AnimatePresence>
+        {showPromptsHelp && (
+          <div className="fixed inset-0 z-[250] flex items-center justify-center p-4">
+            {/* Backdrop */}
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setShowPromptsHelp(false)}
+              className="absolute inset-0 bg-slate-950/80 backdrop-blur-md"
+            />
+            {/* Content Panel */}
+            <motion.div
+              initial={{ opacity: 0, scale: 0.95, y: 15 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.95, y: 15 }}
+              className="relative bg-slate-900 border border-slate-700/80 w-full max-w-2xl rounded-2xl shadow-2xl flex flex-col max-h-[85vh] overflow-hidden font-sans text-slate-200"
+            >
+              <style>{`
+                .no-scrollbar::-webkit-scrollbar {
+                  display: none !important;
+                }
+                .no-scrollbar {
+                  -ms-overflow-style: none !important;
+                  scrollbar-width: none !important;
+                }
+              `}</style>
+
+              {/* Header */}
+              <div className="p-5 border-b border-slate-800 flex justify-between items-center bg-slate-900 sticky top-0 z-10">
+                <div className="flex items-center gap-3">
+                  <div className="p-2 bg-amber-500/10 rounded-xl border border-amber-500/30 font-sans flex items-center justify-center">
+                    <HelpCircle className="w-5 h-5 text-amber-500" />
+                  </div>
+                  <div>
+                    <h4 className="text-base font-black text-white">Socrates 智能篩選器篩選機制</h4>
+                    <p className="text-[10px] text-slate-500 font-bold uppercase tracking-wider">Core Prompt Logic & Filtering Rules</p>
+                  </div>
+                </div>
+                <button
+                  onClick={() => setShowPromptsHelp(false)}
+                  className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition-colors text-sm font-black"
+                >
+                  關閉
+                </button>
+              </div>
+
+              {/* Tab Navigation */}
+              <div className="flex border-b border-slate-800 bg-slate-950 p-1 mb-0 sticky top-[77px] z-10 overflow-x-auto no-scrollbar gap-1">
+                {[
+                  { id: "intro", label: "核心機制", icon: <Bot className="w-4 h-4" /> },
+                  { id: "defensive", label: "🛡️ 防禦穩健", icon: <ShieldCheck className="w-4 h-4 text-indigo-400" /> },
+                  { id: "short", label: "⚔️ 空頭狙擊", icon: <Target className="w-4 h-4 text-rose-400 font-extrabold" /> },
+                  { id: "trend", label: "🚀 多空趨勢", icon: <Zap className="w-4 h-4 text-emerald-400" /> },
+                ].map((tab) => (
+                  <button
+                    key={tab.id}
+                    onClick={() => setHelpTab(tab.id as any)}
+                    className={`flex items-center gap-2 px-3 py-2 text-xs font-black rounded-lg transition-all whitespace-nowrap flex-1 justify-center ${
+                      helpTab === tab.id
+                        ? "bg-slate-850 text-amber-400 border border-slate-700/85 shadow-md font-extrabold"
+                        : "text-slate-400 hover:text-slate-200 hover:bg-slate-800/40"
+                    }`}
+                  >
+                    {tab.icon}
+                    <span>{tab.label}</span>
+                  </button>
+                ))}
+              </div>
+
+              {/* Body Content */}
+              <div className="p-6 overflow-y-auto space-y-5 text-xs leading-relaxed no-scrollbar flex-1">
+                {helpTab === "intro" && (
+                  <div className="space-y-4 animate-in fade-in duration-200">
+                    <div className="bg-slate-950/50 p-4 rounded-xl border border-slate-800/80">
+                      <p className="text-slate-300 font-medium font-sans">
+                        Socrates 智能篩選器背後串接 <span className="text-amber-400 font-bold">Google Gemini 3.5 AI</span> 模型，並與 Yahoo Finance 的即時市場深度數據連動。它嚴格模擬與計算馬丁·阿姆斯壯 (Martin Armstrong) 主導之經濟信心模型 (ECM)、下行週期支撐極限、歷史主要崩盤韌性及蘇格拉底多維系統性評分參數。
+                      </p>
+                    </div>
+
+                    <div className="p-4 bg-slate-800/30 rounded-xl border border-slate-800/80">
+                      <h5 className="font-extrabold text-amber-500 text-sm mb-3 font-sans">🛠️ 多維評分與權重配比</h5>
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-slate-300 font-sans">
+                        <div className="p-2.5 bg-slate-900/50 rounded-lg border border-slate-800/50">
+                          <span className="font-bold text-sky-450 block mb-0.5">AIC (Screener AI Score 1-10)：</span>
+                          <span className="text-slate-400">整體市場多空、經濟週期拐點與總經流動性信心評分。</span>
+                        </div>
+                        <div className="p-2.5 bg-slate-900/50 rounded-lg border border-slate-800/50">
+                          <span className="font-bold text-emerald-450 block mb-0.5">Buy/Sell Score (1-10)：</span>
+                          <span className="text-slate-400">ECM模型內核特徵，表示多頭推升力道 / 空頭拋售警戒水準。</span>
+                        </div>
+                        <div className="p-2.5 bg-slate-900/50 rounded-lg border border-slate-800/50">
+                          <span className="font-bold text-blue-450 block mb-0.5">Quality Score (1-10)：</span>
+                          <span className="text-slate-400">資產負債表體質、毛利護城河與長期資本公允價值判定。</span>
+                        </div>
+                        <div className="p-2.5 bg-slate-900/50 rounded-lg border border-slate-800/50">
+                          <span className="font-bold text-purple-450 block mb-0.5">Value Score (1-10)：</span>
+                          <span className="text-slate-400">本益比/股價淨值比等估值常態分佈安全區間。</span>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {helpTab === "defensive" && (
+                  <div className="space-y-4 animate-in fade-in duration-200">
+                    {/* Mode 1 */}
+                    <div className="p-4 bg-slate-800/50 rounded-xl border border-slate-800 hover:border-slate-700/80 transition-colors">
+                      <div className="flex items-center gap-2 mb-2">
+                        <span className="w-2.5 h-2.5 rounded-full bg-blue-500" />
+                        <h5 className="font-extrabold text-blue-400 text-sm font-sans">🛡️ 防禦型前70 (Defensive Top 70)</h5>
+                      </div>
+                      <div className="pl-4 space-y-2">
+                        <p className="text-slate-400 font-sans">
+                          <strong>邏輯核心：</strong>精選估值安全（穩健護城河）、財務體質卓越、具備極佳市場崩盤防禦力之價值標的。
+                        </p>
+                        <div className="bg-slate-900/50 p-2.5 rounded-lg border border-slate-800/50 space-y-1 text-[11px] font-mono text-slate-300">
+                          <div>• Quality Score &gt; 7 (評分 8 - 10)</div>
+                          <div>• Value Score &gt; 7 (評分 8 - 10)</div>
+                          <div>• Buy Momentum &gt; 4 (評分 5 - 10)</div>
+                          <div>• Crash Resilience &gt; 6 (防禦評分 7 - 10)</div>
+                          <div>• 價位接近支撐: 最新股價必須精確落在 AI 估計之 <span className="text-emerald-400 font-bold">supportPrice 上方 1.5% ~ 2.0%</span> 之內。</div>
+                          <div>• 綜合 Positive 評分 &gt; 4，Negative 評分 &lt; 5</div>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Mode 2 */}
+                    <div className="p-4 bg-slate-800/50 rounded-xl border border-slate-800 hover:border-slate-700/80 transition-colors">
+                      <div className="flex items-center gap-2 mb-2">
+                        <span className="w-2.5 h-2.5 rounded-full bg-indigo-505 animate-pulse" />
+                        <h5 className="font-extrabold text-indigo-400 text-sm font-sans">🛡️ 防禦型前70 + 技術確認 (Defensive Top 70 + Tech)</h5>
+                      </div>
+                      <div className="pl-4 space-y-2">
+                        <p className="text-slate-400 font-sans">
+                          <strong>邏輯核心：</strong>完全繼承「防禦型前70」的財務安全與估值防線。額外對標最新日 K / 週 K 線圖做圖形特徵確認。
+                        </p>
+                        <div className="bg-slate-900/50 p-2.5 rounded-lg border border-slate-800/50 space-y-1 text-[11px] text-slate-300">
+                          <p className="font-mono text-slate-400 mb-1.5 font-sans">額外硬性規定：每檔股票必須完全滿足下列 10 種看漲回升型態之一，並標註於系統中：</p>
+                          <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-indigo-300 font-bold font-sans mt-1">
+                            <div>• W型底</div>
+                            <div>• 三重底</div>
+                            <div>• 頭肩底</div>
+                            <div>• 圓弧底</div>
+                            <div>• 喇叭底</div>
+                            <div>• 看漲旗形</div>
+                            <div>• 看漲對稱三角形</div>
+                            <div>• 看漲持續菱形</div>
+                            <div>• 看漲持續楔形</div>
+                            <div>• 看漲持續三角形</div>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {helpTab === "short" && (
+                  <div className="space-y-4 animate-in fade-in duration-200">
+                    {/* Mode 3 */}
+                    <div className="p-4 bg-slate-800/50 rounded-xl border border-slate-800 hover:border-slate-700/80 transition-colors">
+                      <div className="flex items-center gap-2 mb-2">
+                        <span className="w-2.5 h-2.5 rounded-full bg-rose-500 animate-pulse" />
+                        <h5 className="font-extrabold text-rose-400 text-sm font-sans">⚔️ 猛攻最弱前70 + 技術確認 (Aggressive Short Top 70)</h5>
+                      </div>
+                      <div className="pl-4 space-y-2">
+                        <p className="text-slate-400 font-sans">
+                          <strong>邏輯核心：</strong>用於尋找面臨高風險、高估值、空頭壓力沈重、財務虛弱且已確認頂部圖案的做空與狙擊選項。
+                        </p>
+                        <div className="bg-slate-900/50 p-2.5 rounded-lg border border-slate-800/50 space-y-1 text-[11px] text-slate-300 font-sans">
+                          <div className="font-mono space-y-0.5 mb-2 text-slate-400">
+                            <div>• Quality Score &lt; 3 (評分 1 或 2，基本面極弱)</div>
+                            <div>• Value Score &lt; 4 (評分 1, 2 或 3，定價高昂且估值泡沫)</div>
+                            <div>• Buy Momentum &lt; 3 (買力竭盡、面臨空頭大勢)</div>
+                            <div>• Crash Resilience &lt; 5 (防禦回撤評分極低)</div>
+                            <div>• 綜合 Positive 評分 &lt; 4，Negative 空頭警戒評分 &gt; 8</div>
+                          </div>
+                          <p className="font-mono text-slate-400 border-t border-slate-700/50 pt-2 mt-2 font-sans">技術確認分配型態：必須明確屬於下列 10 種看跌頂形/分派型態之一：</p>
+                          <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-rose-300 font-bold font-sans mt-1">
+                            <div>• M型頂</div>
+                            <div>• 三重頂</div>
+                            <div>• 頭肩頂</div>
+                            <div>• 圓弧頂</div>
+                            <div>• 喇叭頂</div>
+                            <div>• 看跌旗形</div>
+                            <div>• 看跌對稱三角形</div>
+                            <div>• 看跌持續菱形</div>
+                            <div>• 看跌持續楔形</div>
+                            <div>• 看跌持續三角形</div>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {helpTab === "trend" && (
+                  <div className="space-y-4 animate-in fade-in duration-200">
+                    {/* Mode 4 & 5 */}
+                    <div className="p-4 bg-slate-800/50 rounded-xl border border-slate-800 hover:border-slate-700/80 transition-colors">
+                      <div className="flex items-center gap-2 mb-2">
+                        <span className="w-2.5 h-2.5 rounded-full bg-emerald-500" />
+                        <h5 className="font-extrabold text-emerald-400 text-sm font-sans">🚀 最強前50名 (Strongest 50)</h5>
+                      </div>
+                      <div className="pl-4">
+                        <p className="text-slate-400 font-sans mb-2">
+                          <strong>篩選特徵：</strong>結合 Yahoo Finance 最新多頭氣勢與 Socrates 的 buyScores。著重強勁之多頭突破與即將進入大幅上行週期的反轉標的。
+                        </p>
+                      </div>
+                    </div>
+
+                    <div className="p-4 bg-slate-800/50 rounded-xl border border-slate-800 hover:border-slate-700/80 transition-colors">
+                      <div className="flex items-center gap-2 mb-2">
+                        <span className="w-2.5 h-2.5 rounded-full bg-red-500" />
+                        <h5 className="font-extrabold text-red-400 text-sm font-sans">📉 最弱前50名 (Weakest 50)</h5>
+                      </div>
+                      <div className="pl-4">
+                        <p className="text-slate-400 font-sans mb-2">
+                          <strong>篩選特徵：</strong>著重近期高點遇上重大阻力轉弱，或接近下行崩盤拐點。在系統中體現為極高的賣出評分 (sellScores) 與跌勢確立。
+                        </p>
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* Footer */}
+              <div className="p-5 border-t border-slate-800 bg-slate-900 flex justify-end gap-3 sticky bottom-0 z-10">
+                <button
+                  onClick={() => setShowPromptsHelp(false)}
+                  className="px-5 py-2 rounded-xl bg-amber-600 hover:bg-amber-500 text-white font-extrabold transition-colors text-xs font-sans"
+                >
+                  我理解了
+                </button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
     </div>
   );
 };
@@ -2641,13 +3192,481 @@ const TransactionModal = ({
   );
 };
 
+// Helper to categorize any stock into its TradingView Heatmap Industry/Sector classification
+const getTradingViewHeatmapSector = (symbol: string, initialSector?: string): string => {
+  if (!symbol) return "其他產業板塊";
+  const s = symbol.toUpperCase().trim();
+  
+  // Direct precise map based on TradingView S&P 500 stock heatmap groupings:
+  const map: Record<string, string> = {
+    // 💻 Electronic Technology (電子科技 - Chips, Hardware & Semis)
+    "AAPL": "Electronic Technology (電子科技)",
+    "NVDA": "Electronic Technology (電子科技)",
+    "AVGO": "Electronic Technology (電子科技)",
+    "AMD": "Electronic Technology (電子科技)",
+    "QCOM": "Electronic Technology (電子科技)",
+    "INTC": "Electronic Technology (電子科技)",
+    "TXN": "Electronic Technology (電子科技)",
+    "AMAT": "Electronic Technology (電子科技)",
+    "LRCX": "Electronic Technology (電子科技)",
+    "MU": "Electronic Technology (電子科技)",
+    "ADI": "Electronic Technology (電子科技)",
+    "NXPI": "Electronic Technology (電子科技)",
+    "KLAC": "Electronic Technology (電子科技)",
+    "MRVL": "Electronic Technology (電子科技)",
+    "MCHP": "Electronic Technology (電子科技)",
+    "TSM": "Electronic Technology (電子科技)",
+    "ASML": "Electronic Technology (電子科技)",
+    "SMCI": "Electronic Technology (電子科技)",
+
+    // 🌐 Technology Services (科技服務 - Software, Internet & AI Services)
+    "MSFT": "Technology Services (科技服務)",
+    "GOOG": "Technology Services (科技服務)",
+    "GOOGL": "Technology Services (科技服務)",
+    "META": "Technology Services (科技服務)",
+    "ORCL": "Technology Services (科技服務)",
+    "ADBE": "Technology Services (科技服務)",
+    "CRM": "Technology Services (科技服務)",
+    "NFLX": "Technology Services (科技服務)",
+    "PLTR": "Technology Services (科技服務)",
+    "PANW": "Technology Services (科技服務)",
+    "SNOW": "Technology Services (科技服務)",
+    "WDAY": "Technology Services (科技服務)",
+    "ROP": "Technology Services (科技服務)",
+    "CDNS": "Technology Services (科技服務)",
+    "SNPS": "Technology Services (科技服務)",
+    "FTNT": "Technology Services (科技服務)",
+
+    // 🏦 Finance / Financial Services (金融服務)
+    "BRK.B": "Finance (金融服務)",
+    "BRK.A": "Finance (金融服務)",
+    "JPM": "Finance (金融服務)",
+    "BAC": "Finance (金融服務)",
+    "WFC": "Finance (金融服務)",
+    "MS": "Finance (金融服務)",
+    "GS": "Finance (金融服務)",
+    "SPGI": "Finance (金融服務)",
+    "BLK": "Finance (金融服務)",
+    "C": "Finance (金融服務)",
+    "PGR": "Finance (金融服務)",
+    "CB": "Finance (金融服務)",
+    "MMC": "Finance (金融服務)",
+    "AON": "Finance (金融服務)",
+    "AXP": "Finance (金融服務)",
+    "SCHW": "Finance (金融服務)",
+    "USB": "Finance (金融服務)",
+    "PNC": "Finance (金融服務)",
+    "SYF": "Finance (金融服務)",
+    "ALL": "Finance (金融服務)",
+
+    // 🏥 Health Technology (健康科技 - Bio, Pharma, MedTech)
+    "LLY": "Health Technology (健康科技)",
+    "UNH": "Health Technology (健康科技)",
+    "JNJ": "Health Technology (健康科技)",
+    "ABBV": "Health Technology (健康科技)",
+    "MRK": "Health Technology (健康科技)",
+    "TMO": "Health Technology (健康科技)",
+    "ABT": "Health Technology (健康科技)",
+    "PFE": "Health Technology (健康科技)",
+    "AMGN": "Health Technology (健康科技)",
+    "ISRG": "Health Technology (健康科技)",
+    "GILD": "Health Technology (健康科技)",
+    "VRTX": "Health Technology (健康科技)",
+    "SYK": "Health Technology (健康科技)",
+    "REGN": "Health Technology (健康科技)",
+    "MDT": "Health Technology (健康科技)",
+    "BMY": "Health Technology (健康科技)",
+    "BSX": "Health Technology (健康科技)",
+
+    // 🧺 Consumer Non-Durables (非耐用消費品 - FMCG, Soda, Tobacco)
+    "PG": "Consumer Non-Durables (非耐用消費品)",
+    "KO": "Consumer Non-Durables (非耐用消費品)",
+    "PEP": "Consumer Non-Durables (非耐用消費品)",
+    "PM": "Consumer Non-Durables (非耐用消費品)",
+    "MO": "Consumer Non-Durables (非耐用消費品)",
+    "CL": "Consumer Non-Durables (非耐用消費品)",
+    "EL": "Consumer Non-Durables (非耐用消費品)",
+    "KDP": "Consumer Non-Durables (非耐用消費品)",
+    "MDLZ": "Consumer Non-Durables (非耐用消費品)",
+    "GIS": "Consumer Non-Durables (非耐用消費品)",
+    "NSRGY": "Consumer Non-Durables (非耐用消費品)",
+
+    // 🛒 Consumer Services (消費者服務 - Retail, Travel, Streaming)
+    "SE": "Retail Trade (零售貿易 - Internet Retail)",
+    "AMZN": "Consumer Services (消費者服務)",
+    "WMT": "Consumer Services (消費者服務)",
+    "MCD": "Consumer Services (消費者服務)",
+    "DIS": "Consumer Services (消費者服務)",
+    "HD": "Consumer Services (消費者服務)",
+    "LOW": "Consumer Services (消費者服務)",
+    "NKE": "Consumer Services (消費者服務)",
+    "SBUX": "Consumer Services (消費者服務)",
+    "BKNG": "Consumer Services (消費者服務)",
+    "TGT": "Consumer Services (消費者服務)",
+    "TJX": "Consumer Services (消費者服務)",
+    "CMCSA": "Consumer Services (消費者服務)",
+    "CMG": "Consumer Services (消費者服務)",
+    "MAR": "Consumer Services (消費者服務)",
+    "HLT": "Consumer Services (消費者服務)",
+    "YUM": "Consumer Services (消費者服務)",
+
+    // ⚡ Energy Minerals (能源礦產 - Oil, Gas, Drilling)
+    "XOM": "Energy Minerals (能源礦產)",
+    "CVX": "Energy Minerals (能源礦產)",
+    "COP": "Energy Minerals (能源礦產)",
+    "SLB": "Energy Minerals (能源礦產)",
+    "EOG": "Energy Minerals (能源礦產)",
+    "MPC": "Energy Minerals (能源礦產)",
+    "PSX": "Energy Minerals (能源礦產)",
+    "PXD": "Energy Minerals (能源礦產)",
+    "OXY": "Energy Minerals (能源礦產)",
+    "HAL": "Energy Minerals (能源礦產)",
+
+    // 🏭 Producer Manufacturing (生產製造 - Heavy Equipment, Aerospace & Defense)
+    "CAT": "Producer Manufacturing (生產製造)",
+    "GE": "Producer Manufacturing (生產製造)",
+    "DE": "Producer Manufacturing (生產製造)",
+    "HON": "Producer Manufacturing (生產製造)",
+    "LMT": "Producer Manufacturing (生產製造)",
+    "RTX": "Producer Manufacturing (生產製造)",
+    "BA": "Producer Manufacturing (生產製造)",
+    "UPS": "Producer Manufacturing (生產製造)",
+    "FDX": "Producer Manufacturing (生產製造)",
+    "EMR": "Producer Manufacturing (生產製造)",
+    "ETN": "Producer Manufacturing (生產製造)",
+    "ITW": "Producer Manufacturing (生產製造)",
+    "NSC": "Producer Manufacturing (生產製造)",
+
+    // 🧪 Process Industries (流程工業 - Chemicals & Materials)
+    "LIN": "Process Industries (流程工業)",
+    "APD": "Process Industries (流程工業)",
+    "SHW": "Process Industries (流程工業)",
+    "FCX": "Process Industries (流程工業)",
+    "NEM": "Process Industries (流程工業)",
+    "DD": "Process Industries (流程工業)",
+    "ECL": "Process Industries (流程工業)",
+    "DOW": "Process Industries (流程工業)",
+
+    // 💡 Utilities (公用事業 - Power, Gas, Water)
+    "NEE": "Utilities (公用事業)",
+    "SO": "Utilities (公用事業)",
+    "DUK": "Utilities (公用事業)",
+    "AEP": "Utilities (公用事業)",
+    "SRE": "Utilities (公用事業)",
+    "PEG": "Utilities (公用事業)",
+    "EXC": "Utilities (公用事業)",
+    "D": "Utilities (公用事業)",
+    "ED": "Utilities (公用事業)",
+    "WEC": "Utilities (公用事業)",
+
+    // 📞 Communications (通訊服務 - Telecom)
+    "T": "Communications (通訊服務)",
+    "VZ": "Communications (通訊服務)",
+    "TMUS": "Communications (通訊服務)",
+
+    // 💳 Commercial Services (商業服務 - Consulting & Payments)
+    "V": "Commercial Services (商業服務)",
+    "MA": "Commercial Services (商業服務)",
+    "PYPL": "Commercial Services (商業服務)",
+    "ACN": "Commercial Services (商業服務)",
+    "ADP": "Commercial Services (商業服務)",
+    "FIS": "Commercial Services (商業服務)",
+    "FISV": "Commercial Services (商業服務)",
+    "GPN": "Commercial Services (商業服務)",
+
+    // 🚗 Consumer Durables (耐用消費品 - EV, Autos)
+    "TSLA": "Consumer Durables (耐用消費品)",
+    "F": "Consumer Durables (耐用消費品)",
+    "GM": "Consumer Durables (耐用消費品)",
+    "TM": "Consumer Durables (耐用消費品)",
+    "HMC": "Consumer Durables (耐用消費品)",
+  };
+
+  if (map[s]) {
+    return map[s];
+  }
+
+  // Fallback heuristic based on initial sector strings from server or DB:
+  if (initialSector) {
+    const isec = initialSector.toLowerCase().trim();
+    if (isec.includes("electronic") || isec.includes("semiconductor") || isec.includes("chip") || isec.includes("hardware") || isec.includes("electronic technology")) {
+      return "Electronic Technology (電子科技)";
+    }
+    if (isec.includes("software") || isec.includes("internet") || isec.includes("technology service") || isec.includes("computer") || isec.includes("it services")) {
+      return "Technology Services (科技服務)";
+    }
+    if (isec.includes("bank") || isec.includes("finance") || isec.includes("insurance") || isec.includes("financial") || isec.includes("investment")) {
+      return "Finance (金融服務)";
+    }
+    if (isec.includes("health") || isec.includes("pharma") || isec.includes("drug") || isec.includes("medical") || isec.includes("biotech") || isec.includes("health technology")) {
+      return "Health Technology (健康科技)";
+    }
+    if (isec.includes("beverage") || isec.includes("food") || isec.includes("tobacco") || isec.includes("staples") || isec.includes("consumer non-durables")) {
+      return "Consumer Non-Durables (非耐用消費品)";
+    }
+    if (isec.includes("retail") || isec.includes("service") || isec.includes("entertainment") || isec.includes("media") || isec.includes("hotel") || isec.includes("restaurant") || isec.includes("internet retail") || isec.includes("consumer services")) {
+      return "Consumer Services (消費者服務)";
+    }
+    if (isec.includes("energy") || isec.includes("oil") || isec.includes("gas") || isec.includes("petroleum") || isec.includes("drilling") || isec.includes("energy minerals")) {
+      return "Energy Minerals (能源礦產)";
+    }
+    if (isec.includes("manufactur") || isec.includes("industrial") || isec.includes("aerospace") || isec.includes("defense") || isec.includes("machinery") || isec.includes("producer manufacturing")) {
+      return "Producer Manufacturing (生產製造)";
+    }
+    if (isec.includes("chemical") || isec.includes("material") || isec.includes("metal") || isec.includes("mine") || isec.includes("mining") || isec.includes("process industries")) {
+      return "Process Industries (流程工業)";
+    }
+    if (isec.includes("utility") || isec.includes("power") || isec.includes("water") || isec.includes("electric") || isec.includes("utilities")) {
+      return "Utilities (公用事業)";
+    }
+    if (isec.includes("communication") || isec.includes("telecom") || isec.includes("communications")) {
+      return "Communications (通訊服務)";
+    }
+    if (isec.includes("commercial") || isec.includes("payment") || isec.includes("consulting") || isec.includes("commercial services")) {
+      return "Commercial Services (商業服務)";
+    }
+    if (isec.includes("auto") || isec.includes("car") || isec.includes("vehicle") || isec.includes("durable") || isec.includes("consumer durables")) {
+      return "Consumer Durables (耐用消費品)";
+    }
+  }
+
+  // Pre-emptive direct common symbol fallbacks for other typical index/screener holdings
+  if (s === "AAPL" || s === "NVDA" || s === "AVGO" || s === "AMD") return "Electronic Technology (電子科技)";
+  if (s === "MSFT" || s === "META" || s === "GOOG" || s === "GOOGL") return "Technology Services (科技服務)";
+  if (s === "AMZN" || s === "WMT" || s === "TSLA") return "Consumer Services (消費者服務)";
+  if (s === "JPM" || s === "BAC" || s === "GS" || s === "MS") return "Finance (金融服務)";
+  if (s === "LLY" || s === "UNH" || s === "JNJ" || s === "PFE") return "Health Technology (健康科技)";
+
+  return "其他產業板塊";
+};
+
+// Define custom beautiful Morandi sector colors for sophisticated low-saturated matte visual elegance
+const sectorColors: Record<string, { bg: string; border: string; text: string; glow: string }> = {
+  "electronic technology": { bg: "rgba(141, 153, 142, 0.15)", border: "rgba(141, 153, 142, 0.45)", text: "#a3b1a2", glow: "rgba(141, 153, 142, 0.2)" }, // Sage
+  "technology services": { bg: "rgba(119, 136, 152, 0.15)", border: "rgba(119, 136, 152, 0.45)", text: "#a2b2c1", glow: "rgba(119, 136, 152, 0.2)" }, // Dusty Blue
+  "finance": { bg: "rgba(188, 168, 145, 0.15)", border: "rgba(188, 168, 145, 0.45)", text: "#d4c5b3", glow: "rgba(188, 168, 145, 0.2)" }, // Dusty Ocher/Sand
+  "health technology": { bg: "rgba(180, 142, 147, 0.15)", border: "rgba(180, 142, 147, 0.45)", text: "#cbb2b5", glow: "rgba(180, 142, 147, 0.2)" }, // Dusty Rose
+  "consumer services": { bg: "rgba(175, 122, 111, 0.15)", border: "rgba(175, 122, 111, 0.45)", text: "#cba29a", glow: "rgba(175, 122, 111, 0.2)" }, // Terracotta/Muted Coral
+  "consumer non-durables": { bg: "rgba(128, 141, 120, 0.15)", border: "rgba(128, 141, 120, 0.45)", text: "#9fae99", glow: "rgba(128, 141, 120, 0.2)" }, // Olive
+  "consumer durables": { bg: "rgba(150, 120, 141, 0.15)", border: "rgba(150, 120, 141, 0.45)", text: "#bba3b2", glow: "rgba(150, 120, 141, 0.2)" }, // Mauve/Plum
+  "energy minerals": { bg: "rgba(176, 143, 115, 0.15)", border: "rgba(176, 143, 115, 0.45)", text: "#cca992", glow: "rgba(176, 143, 115, 0.2)" }, // Muted Amber
+  "process industries": { bg: "rgba(135, 127, 145, 0.15)", border: "rgba(135, 127, 145, 0.45)", text: "#b5abbf", glow: "rgba(135, 127, 145, 0.2)" }, // Lavender grey
+  "industrial services": { bg: "rgba(145, 137, 124, 0.15)", border: "rgba(145, 137, 124, 0.45)", text: "#bfb5a5", glow: "rgba(145, 137, 124, 0.2)" }, // Warm Grey/Peat
+  "commercial services": { bg: "rgba(185, 180, 145, 0.15)", border: "rgba(185, 180, 145, 0.45)", text: "#cfcbb3", glow: "rgba(185, 180, 145, 0.2)" }, // Muted Wheat/Straw
+  "utilities": { bg: "rgba(140, 160, 145, 0.15)", border: "rgba(140, 160, 145, 0.45)", text: "#abbfbc", glow: "rgba(140, 160, 145, 0.2)" } // Pale Celadon
+};
+
+const getSectorColor = (sectorName: string) => {
+  const normalized = sectorName.toLowerCase().trim();
+  const matchedKey = Object.keys(sectorColors).find(
+    (k) => normalized.includes(k) || k.includes(normalized)
+  );
+  if (matchedKey) return sectorColors[matchedKey];
+
+  // Hash-based dynamic fallback generator so any custom Chinese sector gets a beautiful Morandi color
+  let hash = 0;
+  for (let i = 0; i < sectorName.length; i++) {
+    hash = sectorName.charCodeAt(i) + ((hash << 5) - hash);
+  }
+  const fallbackList = [
+    { bg: "rgba(141, 153, 142, 0.15)", border: "rgba(141, 153, 142, 0.45)", text: "#a3b1a2", glow: "rgba(141, 153, 142, 0.2)" },
+    { bg: "rgba(119, 136, 152, 0.15)", border: "rgba(119, 136, 152, 0.45)", text: "#a2b2c1", glow: "rgba(119, 136, 152, 0.2)" },
+    { bg: "rgba(188, 168, 145, 0.15)", border: "rgba(188, 168, 145, 0.45)", text: "#d4c5b3", glow: "rgba(188, 168, 145, 0.2)" },
+    { bg: "rgba(180, 142, 147, 0.15)", border: "rgba(180, 142, 147, 0.45)", text: "#cbb2b5", glow: "rgba(180, 142, 147, 0.2)" },
+    { bg: "rgba(150, 120, 141, 0.15)", border: "rgba(150, 120, 141, 0.45)", text: "#bba3b2", glow: "rgba(150, 120, 141, 0.2)" },
+    { bg: "rgba(135, 127, 145, 0.15)", border: "rgba(135, 127, 145, 0.45)", text: "#b5abbf", glow: "rgba(135, 127, 145, 0.2)" },
+    { bg: "rgba(176, 143, 115, 0.15)", border: "rgba(176, 143, 115, 0.45)", text: "#cca992", glow: "rgba(176, 143, 115, 0.2)" },
+    { bg: "rgba(140, 160, 145, 0.15)", border: "rgba(140, 160, 145, 0.45)", text: "#abbfbc", glow: "rgba(140, 160, 145, 0.2)" }
+  ];
+  return fallbackList[Math.abs(hash) % fallbackList.length];
+};
+
+const computeBubblePlan = (portfolio: any[], currentPrices: any) => {
+  const itemsWithValues = portfolio.map((item, idx) => {
+    const market = currentPrices[item.symbol?.toUpperCase()];
+    const currentPrice = Number(market?.price || item.avgPrice) || 0;
+    const isShort = item.direction === "short";
+    const profit = isShort ? (item.avgPrice - currentPrice) * item.shares : (currentPrice - item.avgPrice) * item.shares;
+    const value = item.avgPrice * item.shares + profit;
+    const rawSector = getTradingViewHeatmapSector(item.symbol);
+    const sectorShort = rawSector.split(" (")[0] || "其他";
+    const sectorFull = rawSector;
+    return {
+      ...item,
+      originalIdx: idx,
+      currentPrice,
+      value: value > 0 ? value : (item.avgPrice * item.shares),
+      sectorShort,
+      sectorFull
+    };
+  });
+
+  const totalPortfolioValue = itemsWithValues.reduce((acc, item) => acc + item.value, 0) || 1;
+
+  const items = itemsWithValues.map(item => ({
+    ...item,
+    weight: item.value / totalPortfolioValue
+  }));
+
+  // Sort items desc by weight
+  items.sort((a, b) => b.weight - a.weight);
+
+  // Group by sectorShort
+  const groups: Record<string, typeof items> = {};
+  items.forEach(item => {
+    if (!groups[item.sectorShort]) {
+      groups[item.sectorShort] = [];
+    }
+    groups[item.sectorShort].push(item);
+  });
+
+  const sectors = Object.keys(groups).map((sec, sIdx) => {
+    const secItems = groups[sec];
+    const bubbles = secItems.map((item) => {
+      // Scale radius between 38px and 85px safely based on weight
+      const r = 38 + Math.sqrt(item.weight) * 47;
+      return {
+        item,
+        r,
+        localX: 0,
+        localY: 0
+      };
+    });
+
+    const count = bubbles.length;
+    let enclosingR = 50;
+
+    if (count === 1) {
+      bubbles[0].localX = 0;
+      bubbles[0].localY = 10; // Shift down slightly from top center to leave room for top text headers
+      enclosingR = bubbles[0].r + 25;
+    } else if (count === 2) {
+      const b0 = bubbles[0];
+      const b1 = bubbles[1];
+      const dist = b0.r + b1.r + 10;
+      const angle = -Math.PI / 8; // gentle tilt
+      b0.localX = - (dist / 2) * Math.cos(angle);
+      b0.localY = - (dist / 2) * Math.sin(angle) + 12; // Shift down slightly
+      b1.localX = (dist / 2) * Math.cos(angle);
+      b1.localY = (dist / 2) * Math.sin(angle) + 12; // Shift down slightly
+      enclosingR = (dist / 2) + Math.max(b0.r, b1.r) + 24;
+    } else {
+      // Initialize spread pattern
+      bubbles.forEach((b, idx) => {
+        const radiusMultiplier = count > 3 ? 1.3 : 1.1;
+        const angle = (idx * 2 * Math.PI) / count - Math.PI / 2;
+        const dist = (b.r + 20) * radiusMultiplier;
+        b.localX = dist * Math.cos(angle);
+        b.localY = dist * Math.sin(angle) + 12; // shift down slightly
+      });
+
+      // Relaxation for individual bubbles inside this sector
+      for (let bIter = 0; bIter < 100; bIter++) {
+        for (let i = 0; i < count; i++) {
+          for (let j = i + 1; j < count; j++) {
+            const bA = bubbles[i];
+            const bB = bubbles[j];
+            const dx = bB.localX - bA.localX;
+            const dy = bB.localY - bA.localY;
+            const dist = Math.hypot(dx, dy) || 1;
+            const minDistance = bA.r + bB.r + 12; // 12px safe distance
+            if (dist < minDistance) {
+              const overlap = minDistance - dist;
+              const pushX = (dx / dist) * overlap * 0.55;
+              const pushY = (dy / dist) * overlap * 0.55;
+              bA.localX -= pushX;
+              bA.localY -= pushY;
+              bB.localX += pushX;
+              bB.localY += pushY;
+            }
+          }
+        }
+        // Force bubbles to stay slightly below the top of enclosing bounds to leave clean text margin
+        bubbles.forEach((b) => {
+          if (b.localY - b.r < -enclosingR + 24) {
+            b.localY += 2;
+          }
+        });
+      }
+
+      // Re-evaluate actual enclosing boundary circle
+      let maxDist = 50;
+      bubbles.forEach((b) => {
+        const d = Math.hypot(b.localX, b.localY - 10) + b.r;
+        if (d > maxDist) maxDist = d;
+      });
+      enclosingR = maxDist + 22;
+    }
+
+    return {
+      sectorShort: sec,
+      sectorFull: secItems[0].sectorFull,
+      bubbles,
+      enclosingR,
+      cx: 0,
+      cy: 0
+    };
+  });
+
+  const numSectors = sectors.length;
+
+  // Let's set initial beautiful spread positions
+  sectors.forEach((sec, idx) => {
+    if (numSectors === 1) {
+      sec.cx = 400;
+      sec.cy = 210;
+    } else if (numSectors === 2) {
+      sec.cx = idx === 0 ? 250 : 550;
+      sec.cy = 210;
+    } else {
+      const angle = (idx * 2 * Math.PI) / numSectors - Math.PI / 2;
+      sec.cx = 400 + Math.cos(angle) * 180;
+      sec.cy = 210 + Math.sin(angle) * 85;
+    }
+  });
+
+  // Iterative relaxation of sector circles so they NEVER overlap on the 800x420 viewport!
+  for (let iter = 0; iter < 120; iter++) {
+    for (let i = 0; i < numSectors; i++) {
+      for (let j = i + 1; j < numSectors; j++) {
+        const sA = sectors[i];
+        const sB = sectors[j];
+        const dx = sB.cx - sA.cx;
+        const dy = sB.cy - sA.cy;
+        const dist = Math.hypot(dx, dy) || 1;
+        // Keep a minimum clearance of enclosingR_A + enclosingR_B + 30 pixels gap
+        const minDistance = sA.enclosingR + sB.enclosingR + 35;
+        if (dist < minDistance) {
+          const overlap = minDistance - dist;
+          const pushX = (dx / dist) * overlap * 0.52;
+          const pushY = (dy / dist) * overlap * 0.52;
+          sA.cx -= pushX;
+          sA.cy -= pushY;
+          sB.cx += pushX;
+          sB.cy += pushY;
+        }
+      }
+    }
+
+    // Keep sector clouds inside safe SVG margins so they are never clipped
+    sectors.forEach((sec) => {
+      const paddingX = sec.enclosingR + 25;
+      const paddingY = sec.enclosingR + 25;
+      if (sec.cx < paddingX) sec.cx = paddingX;
+      if (sec.cx > 800 - paddingX) sec.cx = 800 - paddingX;
+      if (sec.cy < paddingY) sec.cy = paddingY;
+      if (sec.cy > 420 - paddingY) sec.cy = 420 - paddingY;
+    });
+  }
+
+  return sectors;
+};
+
 const PortfolioModal = ({
   isOpen,
   onClose,
-  trades = [],
   watchlist = [],
   currentPrices = {},
-  onDeleteTrade,
   onDeleteWatch,
   onRefresh,
   isUpdating,
@@ -2655,55 +3674,127 @@ const PortfolioModal = ({
   cloudStatus,
   onImport,
   onExport,
-  onAddTrade,
+  isUpdatingWatchlist = false,
+  watchlistUpdateProgress = "",
+  onUpdateAllWatchlistRatings,
+  onDeleteWatchHistory,
+  onClearWatchHistory,
+  trades = [],
+  user = null,
+  token = null,
+  onLogin,
+  onLogout,
+  onLoadBackup,
 }: any) => {
-  const [activeTab, setActiveTab] = useState<"trades" | "watchlist">("trades");
-  const [transactionModalData, setTransactionModalData] = useState<any>(null);
+  const [selectedWatchSymbol, setSelectedWatchSymbol] = useState<string>("");
+  const [watchlistSearchText, setWatchlistSearchText] = useState<string>("");
+  const [watchlistSelectedSector, setWatchlistSelectedSector] = useState<string>("全部");
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const INITIAL_CAPITAL = 6000;
 
-  if (!isOpen) return null;
+  const activeTab = "watchlist";
+  // -----------------------------------------
 
-  const safeTrades = (Array.isArray(trades) ? trades : []) as Trade[];
+  const sectorsInWatchlist = Array.from(
+    new Set(watchlist.map((item: any) => getTradingViewHeatmapSector(item.symbol)))
+  ).filter(Boolean).sort() as string[];
 
-  const allCalculations = safeTrades.map((trade: any) => {
-    if (!trade || !trade.symbol) return { ...trade, pnl: 0, marketVal: 0 };
-    const market = currentPrices[trade.symbol?.toUpperCase()];
-    const curPrice = Number(market?.price || trade.price) || 0;
-    const entryPrice = Number(trade.price) || 0;
-    const shares = Number(trade.shares) || 0;
-    let pnl = 0;
-    if (trade.type === "Short" || trade.type === "Sell") {
-      pnl = (entryPrice - curPrice) * shares;
-    } else {
-      pnl = (curPrice - entryPrice) * shares;
-    }
-    return { ...trade, pnl, displayPrice: curPrice };
+  const filteredWatchlist = watchlist.filter((item: any) => {
+    const matchesSearch = !watchlistSearchText.trim() ||
+      item.symbol.toLowerCase().includes(watchlistSearchText.toLowerCase()) ||
+      (item.name && item.name.toLowerCase().includes(watchlistSearchText.toLowerCase()));
+    const itemSector = getTradingViewHeatmapSector(item.symbol);
+    const matchesSector = watchlistSelectedSector === "全部" || itemSector === watchlistSelectedSector;
+    return matchesSearch && matchesSector;
   });
 
-  const totalPnL = allCalculations.reduce(
-    (acc: number, t: any) => acc + (Number(t.pnl) || 0),
-    0,
-  );
-  const netLiq = INITIAL_CAPITAL + totalPnL;
+  // Drag and scroll mechanics for Watchlist tabs
+  const watchlistScrollRef = useRef<HTMLDivElement>(null);
+  const isDown = useRef(false);
+  const startX = useRef(0);
+  const scrollLeftState = useRef(0);
+  const dragStartClientX = useRef(0);
+  const hasDragged = useRef(false);
 
-  const formatNum = (num: number) => {
-    if (isNaN(num)) return "0.00";
-    return num.toLocaleString(undefined, {
-      minimumFractionDigits: 2,
-      maximumFractionDigits: 2,
-    });
+  // Drag and scroll mechanics for Sector / Category filtering bar
+  const sectorScrollRef = useRef<HTMLDivElement>(null);
+  const isSectorDown = useRef(false);
+  const startSectorX = useRef(0);
+  const scrollSectorLeftState = useRef(0);
+  const dragSectorStartClientX = useRef(0);
+  const hasSectorDragged = useRef(false);
+
+  const handleDragDown = (e: React.MouseEvent) => {
+    if (!watchlistScrollRef.current) return;
+    isDown.current = true;
+    dragStartClientX.current = e.clientX;
+    startX.current = e.pageX - watchlistScrollRef.current.offsetLeft;
+    scrollLeftState.current = watchlistScrollRef.current.scrollLeft;
+    hasDragged.current = false;
   };
 
-  const groupedTrades = safeTrades.reduce(
-    (groups: Record<string, Trade[]>, t: Trade) => {
-      if (!t || typeof t !== "object" || !t.symbol) return groups;
-      if (!groups[t.symbol]) groups[t.symbol] = [];
-      groups[t.symbol].push(t);
-      return groups;
-    },
-    {} as Record<string, Trade[]>,
-  );
+  const handleDragLeave = () => {
+    isDown.current = false;
+  };
+
+  const handleDragUp = () => {
+    isDown.current = false;
+  };
+
+  const handleDragMove = (e: React.MouseEvent) => {
+    if (!isDown.current || !watchlistScrollRef.current) return;
+    const currentX = e.clientX;
+    const diff = Math.abs(currentX - dragStartClientX.current);
+    if (diff > 5) {
+      hasDragged.current = true;
+    }
+    e.preventDefault();
+    const x = e.pageX - watchlistScrollRef.current.offsetLeft;
+    const walk = (x - startX.current) * 1.5;
+    watchlistScrollRef.current.scrollLeft = scrollLeftState.current - walk;
+  };
+
+  const handleSectorDragDown = (e: React.MouseEvent) => {
+    if (!sectorScrollRef.current) return;
+    isSectorDown.current = true;
+    dragSectorStartClientX.current = e.clientX;
+    startSectorX.current = e.pageX - sectorScrollRef.current.offsetLeft;
+    scrollSectorLeftState.current = sectorScrollRef.current.scrollLeft;
+    hasSectorDragged.current = false;
+  };
+
+  const handleSectorDragLeave = () => {
+    isSectorDown.current = false;
+  };
+
+  const handleSectorDragUp = () => {
+    isSectorDown.current = false;
+  };
+
+  const handleSectorDragMove = (e: React.MouseEvent) => {
+    if (!isSectorDown.current || !sectorScrollRef.current) return;
+    const currentX = e.clientX;
+    const diff = Math.abs(currentX - dragSectorStartClientX.current);
+    if (diff > 5) {
+      hasSectorDragged.current = true;
+    }
+    e.preventDefault();
+    const x = e.pageX - sectorScrollRef.current.offsetLeft;
+    const walk = (x - startSectorX.current) * 1.5;
+    sectorScrollRef.current.scrollLeft = scrollSectorLeftState.current - walk;
+  };
+
+  // Custom modals state for Import & Export choices
+  const [showExportModal, setShowExportModal] = useState(false);
+  const [showImportModal, setShowImportModal] = useState(false);
+  const [isOperatingGD, setIsOperatingGD] = useState(false);
+  const [gdStatusMsg, setGdStatusMsg] = useState("");
+
+  // Custom non-blocking confirmation states to support sandboxed iframe previews
+  const [confirmDeleteWatchSymbol, setConfirmDeleteWatchSymbol] = useState<string | null>(null);
+  const [confirmClearHistorySymbol, setConfirmClearHistorySymbol] = useState<string | null>(null);
+  const [confirmDeleteHistoryItem, setConfirmDeleteHistoryItem] = useState<{ symbol: string; timestamp: number } | null>(null);
+
+  if (!isOpen) return null;
 
   const handleImportClick = () => {
     fileInputRef.current?.click();
@@ -2715,23 +3806,6 @@ const PortfolioModal = ({
       e.target.value = "";
     }
   };
-  const openTransactionModal = (
-    type: string,
-    symbol: string,
-    price: number,
-    name: string,
-  ) => {
-    setTransactionModalData({ type, symbol, price, name });
-  };
-  const handleTransactionConfirm = (
-    type: any,
-    symbol: any,
-    price: any,
-    name: any,
-    shares: any,
-  ) => {
-    onAddTrade(type, symbol, price, name, shares);
-  };
 
   return (
     <>
@@ -2740,8 +3814,8 @@ const PortfolioModal = ({
           <div className="p-6 border-b border-slate-800 flex flex-col gap-4 bg-slate-800/50">
             <div className="flex justify-between items-center">
               <div className="flex items-center gap-3">
-                <Briefcase className="w-8 h-8 text-amber-500" />
-                <h2 className="text-2xl font-black text-white">資產管理</h2>
+                <Eye className="w-8 h-8 text-amber-500" />
+                <h2 className="text-2xl font-black text-white">觀察名單與個股指標盤</h2>
                 {isUpdating && (
                   <Loader2 className="w-5 h-5 animate-spin text-amber-500 ml-2" />
                 )}
@@ -2756,20 +3830,26 @@ const PortfolioModal = ({
                 />
                 <button
                   type="button"
-                  onClick={handleImportClick}
+                  onClick={() => {
+                    setGdStatusMsg("");
+                    setShowImportModal(true);
+                  }}
                   className="p-3 bg-slate-800 rounded-lg hover:bg-slate-700 text-slate-400 flex items-center gap-2 px-4 transition-colors"
                 >
-                  <Upload className="w-5 h-5" />
+                  <Download className="w-5 h-5" />
                   <span className="text-sm font-bold hidden sm:inline">
                     匯入
                   </span>
                 </button>
                 <button
                   type="button"
-                  onClick={onExport}
+                  onClick={() => {
+                    setGdStatusMsg("");
+                    setShowExportModal(true);
+                  }}
                   className="p-3 bg-slate-800 rounded-lg hover:bg-slate-700 text-slate-400 flex items-center gap-2 px-4 transition-colors"
                 >
-                  <Download className="w-5 h-5" />
+                  <Upload className="w-5 h-5" />
                   <span className="text-sm font-bold hidden sm:inline">
                     匯出
                   </span>
@@ -2789,17 +3869,6 @@ const PortfolioModal = ({
                 </button>
                 <button
                   type="button"
-                  onClick={onSyncToCloud}
-                  className="p-3 bg-slate-800 rounded-lg hover:bg-slate-700 text-amber-500 transition-colors"
-                >
-                  {cloudStatus === "syncing" ? (
-                    <Loader2 className="w-5 h-5 animate-spin" />
-                  ) : (
-                    <CloudUpload className="w-5 h-5" />
-                  )}
-                </button>
-                <button
-                  type="button"
                   onClick={onClose}
                   className="p-3 text-slate-400 hover:text-white transition-colors"
                 >
@@ -2807,222 +3876,767 @@ const PortfolioModal = ({
                 </button>
               </div>
             </div>
-            <div className="flex bg-slate-900/50 p-1.5 rounded-xl">
-              <button
-                type="button"
-                onClick={() => setActiveTab("trades")}
-                className={`flex-1 py-3 rounded-lg text-sm font-black transition-all ${activeTab === "trades" ? "bg-amber-600 text-white shadow-lg" : "text-slate-500 hover:text-slate-300"}`}
-              >
-                交易倉位 ({Object.keys(groupedTrades).length})
-              </button>
-              <button
-                type="button"
-                onClick={() => setActiveTab("watchlist")}
-                className={`flex-1 py-3 rounded-lg text-sm font-black transition-all ${activeTab === "watchlist" ? "bg-amber-600 text-white shadow-lg" : "text-slate-500 hover:text-slate-300"}`}
-              >
-                觀察名單 ({watchlist.length})
-              </button>
-            </div>
+
           </div>
-          <div className="p-6 overflow-y-auto custom-scrollbar flex-1">
-            {activeTab === "trades" ? (
-              <>
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
-                  <div className="bg-slate-800 p-6 rounded-2xl border border-slate-700">
-                    <span className="text-xs font-black text-slate-500 uppercase flex items-center gap-2 mb-1">
-                      <Coins className="w-4 h-4" />
-                      淨值
-                    </span>
-                    <div
-                      className={`text-3xl md:text-4xl font-mono font-black ${netLiq >= INITIAL_CAPITAL ? "text-emerald-400" : "text-red-400"}`}
-                    >
-                      ${formatNum(netLiq)}
-                    </div>
-                  </div>
-                  <div className="bg-slate-800 p-6 rounded-2xl border border-slate-700">
-                    <span className="text-xs font-black text-slate-500 uppercase flex items-center gap-2 mb-1">
-                      <Activity className="w-4 h-4" />
-                      總盈虧
-                    </span>
-                    <div
-                      className={`text-3xl md:text-4xl font-mono font-black ${totalPnL >= 0 ? "text-emerald-400" : "text-red-400"}`}
-                    >
-                      {totalPnL >= 0 ? "+" : ""}
-                      {formatNum(totalPnL)}
-                    </div>
-                  </div>
-                </div>
-                {Object.keys(groupedTrades).length === 0 ? (
-                  <div className="text-center py-12 text-slate-500 opacity-50 flex flex-col items-center">
-                    <History className="w-16 h-16 mb-4" />
-                    <p className="text-lg">尚無交易紀錄</p>
-                  </div>
-                ) : (
-                  <div className="space-y-4">
-                    {Object.entries(groupedTrades).map(([symbol, items]) => {
-                      const firstItem = items[0];
-                      const market = currentPrices[symbol?.toUpperCase()];
-                      const curPrice =
-                        Number(market?.price) || Number(firstItem.price) || 0;
-                      let netShares = 0;
-                      items.forEach((t) => {
-                        if (t.type === "Buy" || t.type === "MarginBuy")
-                          netShares += Number(t.shares);
-                        else netShares -= Number(t.shares);
-                      });
-                      return (
-                        <div
-                          key={symbol}
-                          className="bg-slate-800/40 rounded-2xl border border-slate-700 overflow-hidden"
-                        >
-                          <div className="p-5 bg-slate-800/60 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
-                            <div className="flex items-center gap-4">
-                              <div className="bg-slate-700/50 p-3 rounded-lg">
-                                <span className="font-black text-xl text-white block">
-                                  {symbol}
-                                </span>
-                              </div>
-                              <div>
-                                <div className="flex items-baseline gap-2">
-                                  <span className="text-sm text-slate-500 font-bold uppercase">
-                                    淨倉位
-                                  </span>
-                                  <span
-                                    className={`text-base font-black font-mono ${netShares >= 0 ? "text-blue-400" : "text-orange-400"}`}
-                                  >
-                                    {netShares} 股
-                                  </span>
-                                </div>
-                                <div className="text-xs text-slate-500 mt-1">
-                                  現價:{" "}
-                                  <span className="text-slate-300 font-mono text-sm">
-                                    ${curPrice.toFixed(2)}
-                                  </span>
-                                </div>
-                              </div>
-                            </div>
-                            <div className="flex items-center gap-3 w-full sm:w-auto">
-                              <button
-                                onClick={() =>
-                                  openTransactionModal(
-                                    "Buy",
-                                    symbol,
-                                    curPrice,
-                                    firstItem.name,
-                                  )
-                                }
-                                className="flex-1 bg-blue-600/20 hover:bg-blue-600 text-blue-400 hover:text-white px-5 py-2.5 rounded-xl text-sm font-black transition-all"
-                              >
-                                買入
-                              </button>
-                              <button
-                                onClick={() =>
-                                  openTransactionModal(
-                                    "Sell",
-                                    symbol,
-                                    curPrice,
-                                    firstItem.name,
-                                  )
-                                }
-                                className="flex-1 bg-orange-600/20 hover:bg-orange-600 text-orange-400 hover:text-white px-5 py-2.5 rounded-xl text-sm font-black transition-all"
-                              >
-                                賣出
-                              </button>
-                            </div>
-                          </div>
-                          <div className="p-4 bg-slate-900/30 border-t border-slate-700/50">
-                            <div className="space-y-2">
-                              {items.map((t) => (
-                                <div
-                                  key={t.id}
-                                  className="flex justify-between items-center bg-slate-800/30 px-4 py-3 rounded-lg border border-slate-700/30"
-                                >
-                                  <span
-                                    className={`text-xs px-2 py-1 rounded-md font-black w-14 text-center ${t.type.includes("Buy") ? "bg-blue-500/10 text-blue-400" : "bg-orange-500/10 text-orange-400"}`}
-                                  >
-                                    {t.type}
-                                  </span>
-                                  <span className="text-sm font-mono text-slate-300">
-                                    {t.shares} @ ${t.price}
-                                  </span>
-                                  <button
-                                    type="button"
-                                    onClick={() => onDeleteTrade(t.id)}
-                                    className="p-2 text-slate-600 hover:text-red-400"
-                                  >
-                                    <Trash2 className="w-4 h-4" />
-                                  </button>
-                                </div>
-                              ))}
-                            </div>
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
-              </>
-            ) : (
-              <div className="space-y-4">
+          <div className="p-6 overflow-y-auto custom-scrollbar flex-1 font-sans">
+            {/* --- Watchlist Tab Panel --- */}
+            <div className="space-y-4">
                 {watchlist.length === 0 ? (
                   <div className="text-center py-12 text-slate-500 opacity-50 flex flex-col items-center">
                     <Eye className="w-16 h-16 mb-4" />
                     <p className="text-lg">觀察清單目前是空的</p>
                   </div>
                 ) : (
-                  watchlist.map((item: WatchlistItem) => {
-                    const market = currentPrices[item.symbol?.toUpperCase()];
-                    const price = Number(market?.price || item.price) || 0;
-                    const change =
-                      Number(market?.changePercent || item.changePercent) || 0;
-                    return (
-                      <div
-                        key={item.symbol}
-                        className="bg-slate-800/50 p-5 rounded-2xl border border-slate-700 flex justify-between items-center group"
+                  <div>
+                    {/* Top Action Bar for update ratings */}
+                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-4 mb-4 border-b border-slate-800">
+                      <div className="flex flex-col">
+                        <h4 className="font-black text-white text-base flex items-center gap-2">
+                          <Eye className="w-5 h-5 text-amber-500" />
+                          觀察個股指標盤
+                        </h4>
+                        {watchlistUpdateProgress && (
+                          <p className="text-xs text-amber-400 font-bold animate-pulse mt-0.5">
+                            {watchlistUpdateProgress}
+                          </p>
+                        )}
+                      </div>
+                      <button
+                        type="button"
+                        disabled={isUpdatingWatchlist}
+                        onClick={onUpdateAllWatchlistRatings}
+                        className="flex items-center gap-2 bg-gradient-to-r from-amber-600 to-amber-500 hover:from-amber-500 hover:to-amber-400 disabled:opacity-50 text-white px-4 py-2.5 rounded-xl font-bold text-xs transition-all shadow-[0_4px_12px_rgba(217,119,6,0.2)]"
                       >
-                        <div className="flex items-center gap-3">
-                          <span className="font-black text-white text-xl">
-                            {item.symbol}
-                          </span>
-                        </div>
-                        <div className="text-right flex items-center gap-6">
-                          <div>
-                            <div className="font-mono font-black text-amber-500 text-lg">
-                              ${price.toLocaleString()}
-                            </div>
-                            <div
-                              className={`text-xs font-bold ${change >= 0 ? "text-emerald-400" : "text-red-400"}`}
-                            >
-                              {change >= 0 ? "+" : ""}
-                              {change.toFixed(2)}%
-                            </div>
-                          </div>
+                        <RefreshCw className={`w-3.5 h-3.5 ${isUpdatingWatchlist ? "animate-spin" : ""}`} />
+                        {isUpdatingWatchlist ? "正在更新所有評分..." : "更新所有評分"}
+                      </button>
+                    </div>
+
+                    {/* 1. 搜尋 / 即時篩選 */}
+                    <div className="relative mb-3 flex items-center gap-2">
+                      <div className="relative flex-1">
+                        <span className="absolute inset-y-0 left-0 flex items-center pl-3.5 pointer-events-none">
+                          <Search className="h-4 w-4 text-slate-500" />
+                        </span>
+                        <input
+                          type="text"
+                          value={watchlistSearchText}
+                          onChange={(e) => setWatchlistSearchText(e.target.value)}
+                          placeholder="輸入代號、公司名稱篩選秒尋..."
+                          className="w-full bg-slate-950/80 border border-slate-800/80 text-slate-100 placeholder-slate-500 text-xs rounded-xl pl-10 pr-24 py-2.5 font-sans focus:border-amber-500/80 focus:ring-1 focus:ring-amber-500/20 focus:outline-none transition-all"
+                        />
+                        {watchlistSearchText && (
                           <button
                             type="button"
-                            onClick={() => onDeleteWatch(item.symbol)}
-                            className="p-3.5 text-slate-600 hover:text-red-400 transition-all"
+                            onClick={() => setWatchlistSearchText("")}
+                            className="absolute inset-y-0 right-14 flex items-center pr-2 text-slate-400 hover:text-white transition-colors"
                           >
-                            <Trash2 className="w-5 h-5" />
+                            <X className="w-4 h-4 cursor-pointer" />
                           </button>
+                        )}
+                        <span className="absolute inset-y-1.5 right-3 flex items-center text-[10px] text-slate-400 font-mono font-bold bg-slate-900 border border-slate-800/80 px-2 rounded-md">
+                          {
+                            (() => {
+                              const fCount = watchlist.filter((item: any) => {
+                                const matchesSearch = !watchlistSearchText.trim() ||
+                                  item.symbol.toLowerCase().includes(watchlistSearchText.toLowerCase()) ||
+                                  (item.name && item.name.toLowerCase().includes(watchlistSearchText.toLowerCase()));
+                                const itemSector = getTradingViewHeatmapSector(item.symbol);
+                                const matchesSector = watchlistSelectedSector === "全部" || itemSector === watchlistSelectedSector;
+                                return matchesSearch && matchesSector;
+                              }).length;
+                              return `${fCount} / ${watchlist.length} 支`;
+                            })()
+                          }
+                        </span>
+                      </div>
+                    </div>
+
+                    {/* 2. 分組行業標籤頁 (TradingView Heatmap Sector Grouping) */}
+                    <div 
+                      ref={sectorScrollRef}
+                      onMouseDown={handleSectorDragDown}
+                      onMouseLeave={handleSectorDragLeave}
+                      onMouseUp={handleSectorDragUp}
+                      onMouseMove={handleSectorDragMove}
+                      className="flex items-center gap-1.5 overflow-x-auto scrollbar-hide select-none cursor-grab active:cursor-grabbing pb-3 mb-4 border-b border-slate-800/25"
+                    >
+                      {(() => {
+                        const sectorsInWatchlist = Array.from(
+                          new Set(watchlist.map((item: any) => getTradingViewHeatmapSector(item.symbol)))
+                        ).filter(Boolean).sort() as string[];
+
+                        return ["全部", ...sectorsInWatchlist].map((sectorName) => {
+                          const isSectorSelected = watchlistSelectedSector === sectorName;
+                          // Count items in this sector matching the search filter
+                          const sectorItemCount = watchlist.filter((item: any) => {
+                            const matchesSearch = !watchlistSearchText.trim() ||
+                              item.symbol.toLowerCase().includes(watchlistSearchText.toLowerCase()) ||
+                              (item.name && item.name.toLowerCase().includes(watchlistSearchText.toLowerCase()));
+                            const itemSector = getTradingViewHeatmapSector(item.symbol);
+                            return matchesSearch && (sectorName === "全部" || itemSector === sectorName);
+                          }).length;
+
+                          return (
+                            <button
+                              key={sectorName}
+                              type="button"
+                              onClick={() => {
+                                if (hasSectorDragged.current) return;
+                                setWatchlistSelectedSector(sectorName);
+                              }}
+                              className={`px-3 py-1.5 rounded-lg text-[10px] font-black shrink-0 transition-all flex items-center gap-1.5 border cursor-pointer ${
+                                isSectorSelected
+                                  ? "bg-amber-600/20 text-amber-400 border-amber-500/40 shadow-sm font-black"
+                                  : "bg-slate-900/60 text-slate-400 border-slate-800/80 hover:text-slate-200 hover:bg-slate-800/60"
+                              }`}
+                            >
+                              <span>{sectorName}</span>
+                              <span className={`text-[8px] px-1 rounded-full font-mono ${
+                                isSectorSelected ? "bg-amber-500/20 text-amber-300" : "bg-slate-800 text-slate-500"
+                              }`}>
+                                {sectorItemCount}
+                              </span>
+                            </button>
+                          );
+                        });
+                      })()}
+                    </div>
+
+                    {/* Stock tabs: "每增加一個觀察各股則新增一個tab" */}
+                    <>
+                          <div 
+                            ref={watchlistScrollRef}
+                            onMouseDown={handleDragDown}
+                            onMouseLeave={handleDragLeave}
+                            onMouseUp={handleDragUp}
+                            onMouseMove={handleDragMove}
+                            className="flex items-center gap-1.5 overflow-x-auto scrollbar-hide select-none cursor-grab active:cursor-grabbing pb-3 mb-4 border-b border-slate-800/40"
+                          >
+                            {filteredWatchlist.length === 0 ? (
+                              <div className="w-full text-center py-4 text-slate-500 text-xs italic font-sans">
+                                🔍 沒有符合目前搜尋或行業分組的個股
+                              </div>
+                            ) : (
+                              filteredWatchlist.map((item: WatchlistItem) => {
+                                const market = currentPrices[item.symbol?.toUpperCase()];
+                                const price = Number(market?.price || item.price) || 0;
+                                const change = Number(market?.changePercent || item.changePercent) || 0;
+                                const isSelected = (selectedWatchSymbol || (filteredWatchlist[0]?.symbol || watchlist[0]?.symbol)) === item.symbol;
+
+                                return (
+                                  <div key={item.symbol} className="relative shrink-0 flex items-center select-none">
+                                    <button
+                                      key={item.symbol}
+                                      type="button"
+                                      onClick={() => {
+                                        if (hasDragged.current) return;
+                                        setSelectedWatchSymbol(item.symbol);
+                                      }}
+                                      className={`px-4 py-2.5 rounded-xl text-xs font-black shrink-0 transition-all flex items-center gap-2 border ${
+                                        isSelected
+                                          ? "bg-amber-600/10 text-amber-500 border-amber-500/30 pr-8 shadow-[0_2px_10px_rgba(217,119,6,0.1)]"
+                                          : "bg-slate-900/40 text-slate-400 border-transparent hover:text-slate-200 hover:bg-slate-800/40"
+                                      }`}
+                                    >
+                                      <span className="flex flex-col items-start">
+                                        <span>{item.symbol}</span>
+                                        <span className="text-[8px] opacity-75 font-normal scale-90 -ml-1 text-left line-clamp-1 max-w-[70px]">
+                                          {getTradingViewHeatmapSector(item.symbol).split(" (")[0]}
+                                        </span>
+                                      </span>
+                                      <span className="text-[10px] opacity-65 font-mono">
+                                        (${price.toLocaleString()})
+                                      </span>
+                                      <span className={`text-[9px] font-mono font-bold ${change >= 0 ? "text-emerald-400" : "text-red-400"}`}>
+                                        {change >= 0 ? "+" : ""}
+                                        {change.toFixed(1)}%
+                                      </span>
+                                    </button>
+                                    {isSelected && (
+                                      <button
+                                        type="button"
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          setConfirmDeleteWatchSymbol(item.symbol);
+                                        }}
+                                        className="absolute right-1 p-0.5 rounded-md text-slate-400 hover:text-rose-400 hover:bg-rose-500/20 bg-slate-950/80 border border-slate-800 shadow-md transition-all z-30 cursor-pointer pointer-events-auto flex items-center justify-center hover:scale-105 active:scale-95"
+                                        title="取消追蹤"
+                                      >
+                                        <X className="w-3.5 h-3.5" />
+                                      </button>
+                                    )}
+                                  </div>
+                                );
+                              })
+                            )}
+                          </div>
+
+                          {/* Active watched stock details panel */}
+                          {(() => {
+                            const activeSymbol = filteredWatchlist.some((w: any) => w.symbol === selectedWatchSymbol)
+                              ? selectedWatchSymbol
+                              : (filteredWatchlist[0]?.symbol || "");
+                            const currentWatchItem = filteredWatchlist.find((w: any) => w.symbol === activeSymbol);
+                            
+                            if (!currentWatchItem) return null;
+
+                            return (
+                              <div className="space-y-4 animate-in fade-in duration-200">
+                                {/* Active Stock Info Line */}
+                                <div className="flex flex-wrap items-center justify-between text-xs font-bold text-slate-400 px-2 gap-2">
+                                  <div className="flex flex-wrap items-center gap-2">
+                                    <span className="text-white font-mono font-black text-sm">{currentWatchItem.symbol}</span>
+                                    <span className="text-[11px] text-slate-400 bg-slate-900/60 px-1.5 py-0.5 rounded border border-slate-800/40">{currentWatchItem.name}</span>
+                                    <span className="text-[10px] text-amber-400 bg-amber-500/10 border border-amber-500/20 px-1.5 py-0.5 rounded font-bold font-sans">
+                                      {getTradingViewHeatmapSector(currentWatchItem.symbol)}
+                                    </span>
+                                  </div>
+                                  <span className="font-mono text-[10px] text-slate-500">
+                                    指標更新時間: {currentWatchItem.timestamp ? new Date(currentWatchItem.timestamp).toLocaleString("zh-TW") : "無資料"}
+                                  </span>
+                                </div>
+
+                          {/* History Log Table with update/delete management */}
+                          <div className="mt-5 font-sans">
+                            <div className="flex justify-between items-center mb-3 flex-wrap gap-2">
+                              <h6 className="font-black text-slate-300 text-sm flex items-center gap-2">
+                                <TrendingUp className="w-4 h-4 text-amber-500" />
+                                評分歷史與更新履歷變動
+                              </h6>
+                              {Array.isArray(currentWatchItem.history) && currentWatchItem.history.length > 0 && (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setConfirmClearHistorySymbol(currentWatchItem.symbol);
+                                  }}
+                                  className="px-2.5 py-1 text-[10px] bg-red-500/10 hover:bg-red-500/20 text-red-400 rounded-lg transition-all font-black flex items-center gap-1 border border-red-500/20 font-sans"
+                                >
+                                  <Trash2 className="w-3" />
+                                  清除本股全部歷史
+                                </button>
+                              )}
+                            </div>
+
+                          <div className="max-h-[220px] overflow-y-auto custom-scrollbar">
+                            <table className="w-full text-left border-collapse text-xs">
+                              <thead>
+                                <tr className="border-b border-slate-800 text-slate-500 font-extrabold pb-2">
+                                  <th className="py-2 px-1">日期時間</th>
+                                  <th className="py-2 px-1">價格</th>
+                                  <th className="py-2 px-1">漲跌幅</th>
+                                  <th className="py-2 px-1 text-center font-bold font-sans">AI 綜合</th>
+                                  <th className="py-2 px-1 text-center font-bold font-mono">Buy/Sell</th>
+                                  <th className="py-2 px-1 text-center font-bold font-sans">Qual/Val/Crash</th>
+                                  <th className="py-2 px-1 text-center font-bold font-sans">Pos/Neg</th>
+                                  <th className="py-2 px-1 text-center font-bold font-sans">管理</th>
+                                </tr>
+                              </thead>
+                              <tbody className="divide-y divide-slate-800/50 text-slate-300 font-medium font-sans">
+                                {(() => {
+                                  const historyList = Array.isArray(currentWatchItem.history) && currentWatchItem.history.length > 0
+                                    ? currentWatchItem.history
+                                    : [{
+                                        timestamp: currentWatchItem.timestamp,
+                                        price: currentWatchItem.price,
+                                        changePercent: currentWatchItem.changePercent,
+                                        buyScore: currentWatchItem.buyScore,
+                                        sellScore: currentWatchItem.sellScore,
+                                        qualityScore: currentWatchItem.qualityScore,
+                                        valueScore: currentWatchItem.valueScore,
+                                        crashSimilarityScore: currentWatchItem.crashSimilarityScore,
+                                        posScore: currentWatchItem.posScore,
+                                        negScore: currentWatchItem.negScore,
+                                        aiScore: currentWatchItem.aiScore,
+                                        action: currentWatchItem.action,
+                                      }];
+                                  
+                                  const sortedHistory = [...historyList].sort((a, b) => b.timestamp - a.timestamp);
+
+                                  return sortedHistory.map((h, hIdx) => (
+                                    <tr key={hIdx} className="hover:bg-slate-900/40 transition-colors font-sans">
+                                      <td className="py-2 px-1 font-mono text-slate-400">
+                                        {h.timestamp ? new Date(h.timestamp).toLocaleString("zh-TW") : "未知"}
+                                      </td>
+                                      <td className="py-2 px-1 font-mono text-amber-500 font-bold">
+                                        ${Number(h.price || 0).toLocaleString()}
+                                      </td>
+                                      <td className={`py-2 px-1 font-mono font-bold ${Number(h.changePercent || 0) >= 0 ? "text-emerald-400" : "text-red-400"}`}>
+                                        {Number(h.changePercent || 0) >= 0 ? "+" : ""}
+                                        {Number(h.changePercent || 0).toFixed(2)}%
+                                      </td>
+                                      <td className="py-2 px-1 text-center">
+                                        <span className={`px-1.5 py-0.5 rounded text-[10px] font-black ${h.action === "Buy" ? "bg-emerald-500/10 text-emerald-400" : h.action === "Sell" ? "bg-rose-500/10 text-rose-455" : "bg-amber-500/10 text-amber-500"}`}>
+                                          {h.aiScore ?? "N/A"}({h.action === "Buy" ? "買" : h.action === "Sell" ? "賣" : "觀"})
+                                        </span>
+                                      </td>
+                                      <td className="py-2 px-1 text-center font-mono">
+                                        <span className="text-emerald-400">{h.buyScore ?? "N/A"}</span>
+                                        <span className="text-slate-600 mx-1">/</span>
+                                        <span className="text-rose-400">{h.sellScore ?? "N/A"}</span>
+                                      </td>
+                                      <td className="py-2 px-1 text-center font-mono text-slate-400">
+                                        <span>{h.qualityScore ?? "-"}</span>
+                                        <span className="text-slate-700 mx-1">|</span>
+                                        <span>{h.valueScore ?? "-"}</span>
+                                        <span className="text-slate-755 mx-1">|</span>
+                                        <span>{h.crashSimilarityScore ?? "-"}</span>
+                                      </td>
+                                      <td className="py-2 px-1 text-center font-mono font-sans text-slate-300">
+                                        <span className="text-emerald-400 font-sans font-bold">+{h.posScore ?? 0}</span>
+                                        <span className="text-slate-600 mx-1">/</span>
+                                        <span className="text-rose-400 font-sans font-bold">+{h.negScore ?? 0}</span>
+                                      </td>
+                                      <td className="py-2 px-1 text-center">
+                                        <button
+                                          type="button"
+                                          onClick={() => {
+                                            setConfirmDeleteHistoryItem({
+                                              symbol: currentWatchItem.symbol,
+                                              timestamp: h.timestamp
+                                            });
+                                          }}
+                                          className="p-1 text-slate-400 hover:text-red-400 hover:bg-rose-500/10 rounded-md transition-colors"
+                                          title="刪除"
+                                        >
+                                          <Trash2 className="w-3.5 h-3.5 inline" />
+                                        </button>
+                                      </td>
+                                    </tr>
+                                  ));
+                                })()}
+                              </tbody>
+                            </table>
+                          </div>
                         </div>
                       </div>
-                    );
-                  })
+                            );
+                          })()}
+                        </>
+                </div>
                 )}
               </div>
+
+            {/* --- Portfolio Tab Panel --- */}
+            {false && (
+              <div className="space-y-4">
+                <div className="bg-slate-950/60 border border-slate-800/80 rounded-2xl p-4 overflow-hidden relative">
+                  Empty
+                </div>
+              </div>
             )}
+
           </div>
         </div>
       </div>
-      <TransactionModal
-        isOpen={!!transactionModalData}
-        onClose={() => setTransactionModalData(null)}
-        symbol={transactionModalData?.symbol}
-        name={transactionModalData?.name}
-        currentPrice={transactionModalData?.price}
-        defaultType={transactionModalData?.type}
-        onConfirm={handleTransactionConfirm}
-      />
+
+      {/* Modern Confirmation Modals for Watchlist and History Log */}
+      {confirmDeleteWatchSymbol && (
+        <div className="fixed inset-0 z-[220] flex items-center justify-center p-4 animate-fade-in font-sans">
+          <div className="absolute inset-0 bg-black/80 backdrop-blur-xs" onClick={() => setConfirmDeleteWatchSymbol(null)} />
+          <div className="bg-slate-900 border border-slate-700 p-6 rounded-2xl shadow-2xl max-w-sm w-full relative z-30 transform scale-100 transition-all duration-150">
+            <h4 className="text-base font-black text-white mb-2 flex items-center gap-1.5">
+              <Trash2 className="w-5 h-5 text-rose-500 animate-pulse" />
+              確認移除觀察個股
+            </h4>
+            <p className="text-xs text-slate-300 mb-6 font-medium leading-relaxed text-left">
+              確定要將 「<span className="text-amber-500 font-mono font-bold">{confirmDeleteWatchSymbol}</span>」 從您的觀察個股名單中移除嗎？
+            </p>
+            <div className="flex gap-3 justify-end">
+              <button
+                type="button"
+                onClick={() => setConfirmDeleteWatchSymbol(null)}
+                className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-xl text-xs font-bold transition-all border border-slate-700"
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  onDeleteWatch(confirmDeleteWatchSymbol);
+                  const rem = watchlist.filter((w: any) => w.symbol !== confirmDeleteWatchSymbol);
+                  if (rem.length > 0) {
+                    setSelectedWatchSymbol(rem[0].symbol);
+                  } else {
+                    setSelectedWatchSymbol("");
+                  }
+                  setConfirmDeleteWatchSymbol(null);
+                }}
+                className="px-4 py-2 bg-rose-600 hover:bg-rose-500 text-white rounded-xl text-xs font-bold transition-all shadow-md shadow-rose-900/20"
+              >
+                確認移除
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {confirmClearHistorySymbol && (
+        <div className="fixed inset-0 z-[220] flex items-center justify-center p-4 animate-fade-in font-sans">
+          <div className="absolute inset-0 bg-black/80 backdrop-blur-xs" onClick={() => setConfirmClearHistorySymbol(null)} />
+          <div className="bg-slate-900 border border-slate-700 p-6 rounded-2xl shadow-2xl max-w-sm w-full relative z-30 transform scale-100 transition-all duration-150">
+            <h4 className="text-base font-black text-white mb-2 flex items-center gap-1.5">
+              <Trash2 className="w-5 h-5 text-rose-500 animate-pulse" />
+              確認清除股歷
+            </h4>
+            <p className="text-xs text-slate-300 mb-6 font-medium leading-relaxed text-left">
+              確定要清除 「<span className="text-amber-500 font-mono font-bold">{confirmClearHistorySymbol}</span>」 的所有評分歷史與更新履歷變動紀錄嗎？此動作將無法復原。
+            </p>
+            <div className="flex gap-3 justify-end">
+              <button
+                type="button"
+                onClick={() => setConfirmClearHistorySymbol(null)}
+                className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-xl text-xs font-bold transition-all border border-slate-700"
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  onClearWatchHistory(confirmClearHistorySymbol);
+                  setConfirmClearHistorySymbol(null);
+                }}
+                className="px-4 py-2 bg-rose-600 hover:bg-rose-500 text-white rounded-xl text-xs font-bold transition-all shadow-md shadow-rose-900/20"
+              >
+                確認清除
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {confirmDeleteHistoryItem && (
+        <div className="fixed inset-0 z-[220] flex items-center justify-center p-4 animate-fade-in font-sans">
+          <div className="absolute inset-0 bg-black/80 backdrop-blur-xs" onClick={() => setConfirmDeleteHistoryItem(null)} />
+          <div className="bg-slate-900 border border-slate-700 p-6 rounded-2xl shadow-2xl max-w-sm w-full relative z-30 transform scale-100 transition-all duration-150">
+            <h4 className="text-base font-black text-white mb-2 flex items-center gap-1.5">
+              <Trash2 className="w-5 h-5 text-rose-500 animate-pulse" />
+              確認刪除此筆記錄
+            </h4>
+            <p className="text-xs text-slate-300 mb-6 font-medium leading-relaxed text-left">
+              確定要刪除「<span className="text-amber-500 font-mono font-bold">{confirmDeleteHistoryItem.symbol}</span>」在 <span className="text-blue-400 font-mono font-semibold">{new Date(confirmDeleteHistoryItem.timestamp).toLocaleString("zh-TW")}</span> 的評分履歷變動紀錄嗎？
+            </p>
+            <div className="flex gap-3 justify-end">
+              <button
+                type="button"
+                onClick={() => setConfirmDeleteHistoryItem(null)}
+                className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-xl text-xs font-bold transition-all border border-slate-700"
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  onDeleteWatchHistory(confirmDeleteHistoryItem.symbol, confirmDeleteHistoryItem.timestamp);
+                  setConfirmDeleteHistoryItem(null);
+                }}
+                className="px-4 py-2 bg-rose-600 hover:bg-rose-500 text-white rounded-xl text-xs font-bold transition-all shadow-md shadow-rose-900/20"
+              >
+                確認刪除
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+
+
+      {showExportModal && (
+        <div className="fixed inset-0 z-[250] flex items-center justify-center p-4">
+          <div
+            className="absolute inset-0 bg-black/75 backdrop-blur-sm"
+            onClick={() => {
+              if (!isOperatingGD) {
+                setShowExportModal(false);
+                setGdStatusMsg("");
+              }
+            }}
+          />
+          <div className="bg-slate-900 w-full max-w-md rounded-2xl border border-slate-700 p-6 shadow-2xl relative z-10 animate-in fade-in zoom-in-95 duration-200">
+            <div className="flex justify-between items-center mb-6">
+              <h3 className="text-xl font-black text-white flex items-center gap-2">
+                <Download className="w-5 h-5 text-amber-500" />
+                匯出觀察名單與個股指標
+              </h3>
+              <button
+                disabled={isOperatingGD}
+                onClick={() => {
+                  setShowExportModal(false);
+                  setGdStatusMsg("");
+                }}
+                className="text-slate-400 hover:text-white transition-colors bg-slate-800 p-1.5 rounded-lg disabled:opacity-50"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="space-y-4">
+              <button
+                type="button"
+                disabled={isOperatingGD}
+                onClick={() => {
+                  const now = new Date();
+                  const formatDigits = (n: number) => n.toString().padStart(2, '0');
+                  const year = now.getFullYear();
+                  const month = formatDigits(now.getMonth() + 1);
+                  const day = formatDigits(now.getDate());
+                  const hours = formatDigits(now.getHours());
+                  const minutes = formatDigits(now.getMinutes());
+                  const seconds = formatDigits(now.getSeconds());
+                  const dateString = `${year}-${month}-${day}_${hours}-${minutes}-${seconds}`;
+                  const filename = `${dateString}.json`;
+
+                  const backupData = { trades, watchlist };
+                  const b = new Blob([JSON.stringify(backupData, null, 2)], {
+                    type: "application/json",
+                  });
+                  const u = URL.createObjectURL(b);
+                  const l = document.createElement("a");
+                  l.href = u;
+                  l.download = filename;
+                  l.click();
+                  
+                  setGdStatusMsg(`已成功備份至本機！檔名: ${filename}`);
+                }}
+                className="w-full flex items-center gap-4 bg-slate-800 hover:bg-slate-750 border border-slate-700/80 p-4 rounded-xl text-left transition-all hover:border-amber-500/30"
+              >
+                <div className="p-2.5 bg-amber-500/10 rounded-lg text-amber-500">
+                  <Download className="w-5 h-5" />
+                </div>
+                <div className="flex-1">
+                  <h4 className="font-bold text-white text-sm">備份至本機 (JSON)</h4>
+                  <p className="text-xs text-slate-400 mt-1">直接下載備份檔案至本機設備，以當天日期時間命名的 JSON 檔案。</p>
+                </div>
+              </button>
+
+              <div className="border-t border-slate-800 my-4" />
+
+              {!user || !token ? (
+                <div className="bg-slate-950 border border-slate-800 p-4 rounded-xl flex flex-col items-center text-center">
+                  <Cloud className="w-8 h-8 text-slate-500 mb-2" />
+                  <p className="text-xs text-slate-400 mb-3">請先完成登入即可一鍵備份至 Google Drive 的專屬資料夾內。</p>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onLogin();
+                    }}
+                    className="flex items-center gap-2 bg-slate-800 hover:bg-slate-755 text-white font-bold text-xs px-4 py-2.5 rounded-lg border border-slate-700 transition-all shadow-md"
+                  >
+                    <svg className="w-4 h-4" viewBox="0 0 24 24">
+                      <path fill="#ea4335" d="M12 5.04c1.64 0 3.12.56 4.28 1.67l3.2-3.2C17.52 1.58 14.94 1 12 1 7.24 1 3.13 3.76 1.13 7.78l3.78 2.93c.92-2.76 3.51-4.67 7.09-4.67z" />
+                      <path fill="#4285f4" d="M23.49 12.27c0-.81-.07-1.59-.2-2.33H12v4.51h6.44c-.29 1.5-.1.81-1.14 2l3.7 2.87c2.16-1.99 3.49-4.92 3.49-7.05z" />
+                      <path fill="#fbbc05" d="M4.91 14.85l-3.78 2.93c2 4.02 6.11 6.78 10.87 6.78 2.94 0 5.61-.96 7.49-2.61l-3.7-2.87c-.98.66-2.23 1.06-3.79 1.06-3.58 0-6.17-1.91-7.09-4.67L4.91 14.85z" />
+                      <path fill="#34a853" d="M12 23.56c4.76 0 8.87-2.76 10.87-6.78l-3.7-2.87c-.92 2.76-3.51 4.67-7.09 4.67-1.64 0-3.12-.56-4.28-1.67l-3.2 3.2c1.96 1.93 4.54 3.45 7.49 3.45z" />
+                    </svg>
+                    Google 帳號登入
+                  </button>
+                </div>
+              ) : (
+                <button
+                  type="button"
+                  disabled={isOperatingGD}
+                  onClick={async () => {
+                    setIsOperatingGD(true);
+                    setGdStatusMsg("");
+                    try {
+                      const now = new Date();
+                      const formatDigits = (n: number) => n.toString().padStart(2, '0');
+                      const year = now.getFullYear();
+                      const month = formatDigits(now.getMonth() + 1);
+                      const day = formatDigits(now.getDate());
+                      const hours = formatDigits(now.getHours());
+                      const minutes = formatDigits(now.getMinutes());
+                      const seconds = formatDigits(now.getSeconds());
+                      const dateString = `${year}-${month}-${day}_${hours}-${minutes}-${seconds}`;
+                      const filename = `Socrates_Portfolio_Backup_${dateString}.json`;
+
+                      const backupData = {
+                        trades,
+                        watchlist,
+                        backedUpAt: now.toISOString()
+                      };
+
+                      await gdrive.uploadFileToGoogleDrive(
+                        token,
+                        filename,
+                        "application/json",
+                        JSON.stringify(backupData, null, 2),
+                        "Socrates_ECM_Backup"
+                      );
+                      setGdStatusMsg(`備份成功！已上傳至 Google Drive 的 Socrates_ECM_Backup 資料夾中。檔名: ${filename}`);
+                    } catch (err: any) {
+                      console.error(err);
+                      if (err.message === "401_UNAUTHORIZED" || err.message?.includes("401")) {
+                        setGdStatusMsg("您的 Google 帳號授權已過期，請重新登入。");
+                        onLogout?.();
+                      } else {
+                        setGdStatusMsg(`雲端備份失敗: ${err.message || err}`);
+                      }
+                    } finally {
+                      setIsOperatingGD(false);
+                    }
+                  }}
+                  className="w-full flex items-center gap-4 bg-slate-800 hover:bg-slate-750 border border-slate-700/80 p-4 rounded-xl text-left transition-all hover:border-emerald-500/30"
+                >
+                  <div className="p-2.5 bg-emerald-500/10 rounded-lg text-emerald-500">
+                    {isOperatingGD ? (
+                      <Loader2 className="w-5 h-5 animate-spin" />
+                    ) : (
+                      <Cloud className="w-5 h-5" />
+                    )}
+                  </div>
+                  <div className="flex-1">
+                    <h4 className="font-bold text-white text-sm">備份至 Google Drive</h4>
+                    <p className="text-xs text-slate-400 mt-1">一鍵將資料備份並上傳至雲端 Socrates_ECM_Backup 資料夾。</p>
+                  </div>
+                </button>
+              )}
+
+              {gdStatusMsg && (
+                <div className={`mt-4 p-3.5 rounded-xl border text-xs font-bold leading-relaxed text-center ${gdStatusMsg.includes("失敗") ? "bg-rose-500/10 border-rose-500/30 text-rose-400" : "bg-emerald-500/10 border-emerald-500/30 text-emerald-400"}`}>
+                  {gdStatusMsg}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showImportModal && (
+        <div className="fixed inset-0 z-[250] flex items-center justify-center p-4">
+          <div
+            className="absolute inset-0 bg-black/75 backdrop-blur-sm"
+            onClick={() => {
+              if (!isOperatingGD) {
+                setShowImportModal(false);
+                setGdStatusMsg("");
+              }
+            }}
+          />
+          <div className="bg-slate-900 w-full max-w-md rounded-2xl border border-slate-700 p-6 shadow-2xl relative z-10 animate-in fade-in zoom-in-95 duration-200">
+            <div className="flex justify-between items-center mb-6">
+              <h3 className="text-xl font-black text-white flex items-center gap-2">
+                <Upload className="w-5 h-5 text-amber-500" />
+                匯入備份資料
+              </h3>
+              <button
+                disabled={isOperatingGD}
+                onClick={() => {
+                  setShowImportModal(false);
+                  setGdStatusMsg("");
+                }}
+                className="text-slate-400 hover:text-white transition-colors bg-slate-800 p-1.5 rounded-lg disabled:opacity-50"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="space-y-4">
+              <button
+                type="button"
+                disabled={isOperatingGD}
+                onClick={() => {
+                  setShowImportModal(false);
+                  handleImportClick();
+                }}
+                className="w-full flex items-center gap-4 bg-slate-800 hover:bg-slate-750 border border-slate-700/80 p-4 rounded-xl text-left transition-all hover:border-amber-500/30"
+              >
+                <div className="p-2.5 bg-amber-500/10 rounded-lg text-amber-500">
+                  <Upload className="w-5 h-5" />
+                </div>
+                <div className="flex-1">
+                  <h4 className="font-bold text-white text-sm">從本機匯入 (JSON)</h4>
+                  <p className="text-xs text-slate-400 mt-1">選取本機備份的 JSON 檔案，匯入觀察個股與交易歷史。</p>
+                </div>
+              </button>
+
+              <div className="border-t border-slate-800 my-4" />
+
+              {!user || !token ? (
+                <div className="bg-slate-950 border border-slate-800 p-4 rounded-xl flex flex-col items-center text-center">
+                  <Cloud className="w-8 h-8 text-slate-500 mb-2" />
+                  <p className="text-xs text-slate-400 mb-3">請先完成登入即可從 Google Drive 專屬資料夾載入最新備份。</p>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onLogin();
+                    }}
+                    className="flex items-center gap-2 bg-slate-800 hover:bg-slate-755 text-white font-bold text-xs px-4 py-2.5 rounded-lg border border-slate-700 transition-all shadow-md"
+                  >
+                    <svg className="w-4 h-4" viewBox="0 0 24 24">
+                      <path fill="#ea4335" d="M12 5.04c1.64 0 3.12.56 4.28 1.67l3.2-3.2C17.52 1.58 14.94 1 12 1 7.24 1 3.13 3.76 1.13 7.78l3.78 2.93c.92-2.76 3.51-4.67 7.09-4.67z" />
+                      <path fill="#4285f4" d="M23.49 12.27c0-.81-.07-1.59-.2-2.33H12v4.51h6.44c-.29 1.5-.1.81-1.14 2l3.7 2.87c2.16-1.99 3.49-4.92 3.49-7.05z" />
+                      <path fill="#fbbc05" d="M4.91 14.85l-3.78 2.93c2 4.02 6.11 6.78 10.87 6.78 2.94 0 5.61-.96 7.49-2.61l-3.7-2.87c-.98.66-2.23 1.06-3.79 1.06-3.58 0-6.17-1.91-7.09-4.67L4.91 14.85z" />
+                      <path fill="#34a853" d="M12 23.56c4.76 0 8.87-2.76 10.87-6.78l-3.7-2.87c-.92 2.76-3.51 4.67-7.09 4.67-1.64 0-3.12-.56-4.28-1.67l-3.2 3.2c1.96 1.93 4.54 3.45 7.49 3.45z" />
+                    </svg>
+                    Google 帳號登入
+                  </button>
+                </div>
+              ) : (
+                <button
+                  type="button"
+                  disabled={isOperatingGD}
+                  onClick={async () => {
+                    setIsOperatingGD(true);
+                    setGdStatusMsg("");
+                    try {
+                      // 1. List backup files from drive
+                      const files = await gdrive.listBackupFilesFromGoogleDrive(token, "Socrates_ECM_Backup");
+                      if (files && files.length > 0) {
+                        const latestFile = files[0];
+                        // 2. Download the file content
+                        const restored = await gdrive.downloadFileFromGoogleDrive(token, latestFile.id);
+                        if (restored && (restored.trades || restored.watchlist)) {
+                          // 3. Load using existing handler
+                          onLoadBackup(restored.trades || [], restored.watchlist || []);
+                          setGdStatusMsg(`成功匯入最新雲端備份！備份創立時間：${new Date(latestFile.createdTime).toLocaleString()}`);
+                          setTimeout(() => {
+                            setShowImportModal(false);
+                            setGdStatusMsg("");
+                          }, 2500);
+                        } else {
+                          setGdStatusMsg("備份檔案中的數據格式不正確。");
+                        }
+                      } else {
+                        setGdStatusMsg("找不到任何 Socrates 相關的雲端備份檔案 (.json)。");
+                      }
+                    } catch (err: any) {
+                      console.error(err);
+                      if (err.message === "401_UNAUTHORIZED" || err.message?.includes("401")) {
+                        setGdStatusMsg("您的 Google 帳號授權已過期，請重新登入。");
+                        onLogout?.();
+                      } else {
+                        setGdStatusMsg(`雲端匯入失敗: ${err.message || err}`);
+                      }
+                    } finally {
+                      setIsOperatingGD(false);
+                    }
+                  }}
+                  className="w-full flex items-center gap-4 bg-slate-800 hover:bg-slate-755 border border-slate-700/80 p-4 rounded-xl text-left transition-all hover:border-emerald-500/30"
+                >
+                  <div className="p-2.5 bg-emerald-500/10 rounded-lg text-emerald-500">
+                    {isOperatingGD ? (
+                      <Loader2 className="w-5 h-5 animate-spin" />
+                    ) : (
+                      <Cloud className="w-5 h-5" />
+                    )}
+                  </div>
+                  <div className="flex-1">
+                    <h4 className="font-bold text-white text-sm">由 Google Drive 最新備份復原</h4>
+                    <p className="text-xs text-slate-400 mt-1">從 Socrates_ECM_Backup 資料夾載入最新的一份備份檔案並還原。</p>
+                  </div>
+                </button>
+              )}
+
+              {gdStatusMsg && (
+                <div className={`mt-4 p-3.5 rounded-xl border text-xs font-bold leading-relaxed text-center ${gdStatusMsg.includes("失敗") || gdStatusMsg.includes("找不到") ? "bg-rose-500/10 border-rose-500/30 text-rose-400" : "bg-emerald-500/10 border-emerald-500/30 text-emerald-400"}`}>
+                  {gdStatusMsg}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </>
   );
 };
@@ -3035,6 +4649,13 @@ const ReportView = ({
   stockData,
   onFetchNewsInsight,
   newsLoading,
+  onFetchFinancialHealth,
+  financialHealthLoading,
+  onFetchRiskAnalysis,
+  riskAnalysisLoading,
+  gdUser,
+  gdToken,
+  onOpenWorkspaceHub,
 }: {
   report: StockReport | null;
   onGenerate: () => void;
@@ -3043,12 +4664,115 @@ const ReportView = ({
   stockData: StockData;
   onFetchNewsInsight: () => void;
   newsLoading: boolean;
+  onFetchFinancialHealth: () => void;
+  financialHealthLoading: boolean;
+  onFetchRiskAnalysis: () => void;
+  riskAnalysisLoading: boolean;
+  gdUser: any;
+  gdToken: string | null;
+  onOpenWorkspaceHub: () => void;
 }) => {
   const [strategyTab, setStrategyTab] = useState<
     "pyramid" | "inverted" | "hybrid"
   >("pyramid");
   const [isStrategyOpen, setIsStrategyOpen] = useState(false);
   const [isBacktestOpen, setIsBacktestOpen] = useState(false);
+  const [isNewsOpen, setIsNewsOpen] = useState(false);
+  const [isFinancialHealthOpen, setIsFinancialHealthOpen] = useState(false);
+  const [isRiskAnalysisOpen, setIsRiskAnalysisOpen] = useState(false);
+
+  // --- Google Workspace Features States ---
+  const [isExportingDoc, setIsExportingDoc] = useState(false);
+  const [docSuccessUrl, setDocSuccessUrl] = useState<string | null>(null);
+
+  const [chatSpaces, setChatSpaces] = useState<any[]>([]);
+  const [loadingSpaces, setLoadingSpaces] = useState(false);
+  const [selectedSpace, setSelectedSpace] = useState("");
+  const [customComment, setCustomComment] = useState("");
+  const [isPostingChat, setIsPostingChat] = useState(false);
+  const [chatSuccessMsg, setChatSuccessMsg] = useState("");
+  const [chatErrorMsg, setChatErrorMsg] = useState("");
+
+  const handleExportDoc = async () => {
+    if (!gdToken) {
+      onOpenWorkspaceHub();
+      return;
+    }
+    setIsExportingDoc(true);
+    setDocSuccessUrl(null);
+    try {
+      const overviewText = report?.tradingStrategy.overview || "無 Socrates 交易訊號詳情。";
+      const newsInsightText = report?.newsInsight?.comprehensiveAnalysis || report?.newsInsight?.summary || "尚未創立或雙擊載入新聞摘要與市場洞察分析。";
+      const synthesisText = `【Socrates 整合分析總覽】\n${overviewText}\n\n【最新市場洞察與精選智慧資訊解讀】\n${newsInsightText}`;
+      const result = await workspace.exportReportToGoogleDoc(gdToken, stockData, synthesisText);
+      setDocSuccessUrl(result.documentUrl);
+    } catch (err: any) {
+      console.error(err);
+      alert("儲存至 Google Docs 失敗，請確認是否授權或稍後重試。");
+    } finally {
+      setIsExportingDoc(false);
+    }
+  };
+
+  const loadChatSpaces = async () => {
+    if (!gdToken) return;
+    setLoadingSpaces(true);
+    try {
+      const spaces = await workspace.listGoogleChatSpaces(gdToken);
+      setChatSpaces(spaces);
+      if (spaces.length > 0) {
+        setSelectedSpace(spaces[0].name);
+      }
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setLoadingSpaces(false);
+    }
+  };
+
+  useEffect(() => {
+    if (gdToken) {
+      loadChatSpaces();
+    }
+  }, [gdToken]);
+
+  const handlePostChat = async () => {
+    if (!gdToken) return;
+    if (!selectedSpace) {
+      setChatErrorMsg("請選擇要分享的 Google Chat 聊天室空間");
+      return;
+    }
+    setIsPostingChat(true);
+    setChatSuccessMsg("");
+    setChatErrorMsg("");
+
+    const tpDate = stockData.nextTurningPoint || "未知";
+    const anchor = stockData.anchorType === "High" ? "多頭高點轉折 (Peak)" : "空頭低點轉折 (Trough)";
+    const technicalScore = stockData.screenerRating?.score ?? 5.0;
+
+    const message = `📊 Socrates ECM 循環與指標轉折警報 🚨
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+• 股票標的: ${stockData.symbol} (${stockData.name})
+• 目前價格: ${stockData.price} ${stockData.currency || "USD"} (${stockData.changePercent != null ? (stockData.changePercent > 0 ? "+" : "") + stockData.changePercent + "%" : "0%"})
+• 技術評鑑: ${technicalScore} / 10 分
+• 預計下一轉折: ${tpDate} (型態: ${anchor})
+• 專家備忘錄：${customComment || "請注意此轉折點的週期變化配置，可適時調整槓桿。"}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+報告來源：Socrates Cycle Advisor
+`;
+
+    try {
+      await workspace.postMessageToGoogleChat(gdToken, selectedSpace, message);
+      setChatSuccessMsg("🎉 成功發送循環警報快訊至 Google Chat！");
+      setCustomComment("");
+      setTimeout(() => setChatSuccessMsg(""), 5000);
+    } catch (err: any) {
+      console.error(err);
+      setChatErrorMsg("發送失敗，請確認該討論區已授權。");
+    } finally {
+      setIsPostingChat(false);
+    }
+  };
 
   const phaseMap: Record<string, string> = {
     "Pre-market": "盤前準備",
@@ -3112,80 +4836,473 @@ const ReportView = ({
         </button>
       </div>
 
-      {/* 2. News & Insights */}
-      <div 
-        className="bg-slate-800 rounded-3xl border border-slate-700 overflow-hidden shadow-xl mb-8 flex flex-col cursor-pointer transition-colors hover:border-slate-600"
-        onDoubleClick={() => !report?.newsInsight && !newsLoading && onFetchNewsInsight()}
-      >
-        <div className="p-6 bg-slate-900/80 border-b border-slate-700 flex items-center justify-between">
+      {/* Google Workspace Suite Integration Dashboard */}
+      <div className="bg-slate-900 border border-slate-800 rounded-3xl p-6 shadow-xl relative overflow-hidden">
+        <div className="absolute top-0 right-0 w-64 h-64 bg-amber-500/5 blur-3xl rounded-full pointer-events-none" />
+        <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 mb-6 pb-4 border-b border-slate-800">
+          <div>
+            <h3 className="text-lg font-black text-white flex items-center gap-2">
+              <Cloud className="w-5 h-5 text-amber-500" />
+              Socrates 團隊協作與 Google 整合套件
+            </h3>
+            <p className="text-xs text-slate-400">
+              將 Martin Armstrong 循環與 AI 合成精華，一鍵多格式導出，推播到團隊討論中
+            </p>
+          </div>
+          {!gdToken ? (
+            <button
+              onClick={onOpenWorkspaceHub}
+              className="bg-amber-600 hover:bg-amber-500 text-white font-bold text-xs py-2 px-4 rounded-xl shadow-lg transition-transform hover:scale-105 active:scale-95"
+            >
+              🔑 連結 Google 帳戶啟用 Docs & Chat 整合
+            </button>
+          ) : (
+            <div className="flex items-center gap-2 text-xs bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 font-bold px-3 py-1.5 rounded-lg text-emerald-300">
+              <span className="w-1.5 h-1.5 bg-emerald-400 rounded-full animate-ping mr-1" />
+              雲端整合套件已授權啟用
+            </div>
+          )}
+        </div>
+
+        {gdToken && (
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+            {/* Google Docs Column */}
+            <div className="bg-slate-950 p-5 rounded-2xl border border-slate-850 flex flex-col justify-between space-y-4">
+              <div className="space-y-2">
+                <h4 className="text-white text-sm font-black flex items-center gap-2">
+                  <span className="p-1 px-1.5 bg-blue-500/10 text-blue-400 rounded font-bold text-[10px]">DOCS</span>
+                  產生 Google Docs 專屬電子文檔
+                </h4>
+                <p className="text-xs text-slate-400 leading-relaxed">
+                  本系統會將 Socrates 轉折點、近 5 日智能交易警報信號及 AI 市場分析，自動撰寫成一篇高可讀、可排版的 Google Docs 公報，供您儲存於雲端、列印或進行格式微調。
+                </p>
+              </div>
+
+              <div className="space-y-3">
+                {docSuccessUrl && (
+                  <div className="bg-blue-500/10 border border-blue-500/20 p-2.5 rounded-xl text-xs flex justify-between items-center animate-in fade-in">
+                    <span className="text-blue-300 font-bold">文件儲存成功！</span>
+                    <a
+                      href={docSuccessUrl}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="text-white hover:text-blue-400 underline font-bold flex items-center gap-1"
+                    >
+                      開啟 Google 文件 <ExternalLink className="w-3 h-3" />
+                    </a>
+                  </div>
+                )}
+                <button
+                  onClick={handleExportDoc}
+                  disabled={isExportingDoc}
+                  className="w-full flex items-center justify-center gap-2 bg-slate-850 hover:bg-blue-600/20 hover:text-blue-400 text-slate-200 border border-slate-850 hover:border-blue-500/30 transition-all font-bold text-xs py-2.5 px-4 rounded-xl"
+                >
+                  {isExportingDoc ? (
+                    <>
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      正在撰寫與生成文件...
+                    </>
+                  ) : (
+                    <>
+                      <FileText className="w-3.5 h-3.5 text-blue-400" />
+                      匯出為 Google Docs 文檔
+                    </>
+                  )}
+                </button>
+              </div>
+            </div>
+
+            {/* Google Chat Column */}
+            <div className="bg-slate-950 p-5 rounded-2xl border border-slate-850 flex flex-col justify-between gap-4">
+              <div className="space-y-2">
+                <h4 className="text-white text-sm font-black flex items-center gap-2">
+                  <span className="p-1 px-1.5 bg-amber-500/10 text-amber-500 rounded font-bold text-[10px]">CHAT</span>
+                  轉發循環警報至 Google Chat 空間
+                </h4>
+                <p className="text-xs text-slate-400 leading-relaxed">
+                  在群組討論、同業社群中，直接將本股票循環警報、重要的高低位轉折點和目前評級一鍵推播分享。
+                </p>
+              </div>
+
+              <div className="space-y-3">
+                {/* Space Selector */}
+                {loadingSpaces ? (
+                  <div className="flex items-center gap-2 text-xs text-slate-500 p-2">
+                    <Loader2 className="w-3.5 h-3.5 animate-spin text-amber-500" />
+                    正在載入您的聊天室討論群組...
+                  </div>
+                ) : chatSpaces.length === 0 ? (
+                  <div className="text-xs text-slate-500 bg-slate-900 border border-slate-850 p-2.5 rounded-xl font-bold">
+                    未檢測到公開的 Google Chat 聊天室空間（請確認帳戶加入空間）。
+                  </div>
+                ) : (
+                  <div className="flex flex-col gap-1.5 text-left">
+                    <label className="text-slate-500 text-[10px] font-black uppercase">
+                      發送目標空間 
+                    </label>
+                    <select
+                      value={selectedSpace}
+                      onChange={(e) => setSelectedSpace(e.target.value)}
+                      className="w-full bg-slate-900 border border-slate-850 text-xs text-white rounded-xl px-2.5 py-2 font-bold outline-none"
+                    >
+                      {chatSpaces.map((sp: any) => (
+                        <option key={sp.name} value={sp.name}>
+                          {sp.displayName || sp.name}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                )}
+
+                {/* Optional Custom Alert Message comment */}
+                <div className="flex flex-col gap-1.5 text-left">
+                  <label className="text-slate-500 text-[10px] font-black uppercase">
+                    附加專家備忘錄 (可選)
+                  </label>
+                  <input
+                    type="text"
+                    value={customComment}
+                    onChange={(e) => setCustomComment(e.target.value)}
+                    placeholder="例如：六月即將轉向，建議配置避險權益..."
+                    className="w-full bg-slate-900 border border-slate-850 text-xs text-slate-200 rounded-xl px-2.5 py-2 outline-none focus:border-amber-500 transition-colors"
+                  />
+                </div>
+
+                {chatSuccessMsg && (
+                  <div className="bg-emerald-500/10 text-emerald-400 p-2 rounded-lg border border-emerald-500/20 text-xs font-bold animate-in fade-in">
+                    {chatSuccessMsg}
+                  </div>
+                )}
+                {chatErrorMsg && (
+                  <div className="bg-rose-500/10 text-rose-400 p-2 rounded-lg border border-rose-500/20 text-xs font-bold animate-in fade-in">
+                    {chatErrorMsg}
+                  </div>
+                )}
+
+                <button
+                  onClick={handlePostChat}
+                  disabled={isPostingChat || chatSpaces.length === 0}
+                  className="w-full flex items-center justify-center gap-2 bg-amber-600 hover:bg-amber-500 text-white font-bold text-xs py-2.5 px-4 rounded-xl transition-all disabled:opacity-50"
+                >
+                  {isPostingChat ? (
+                    <>
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      發佈中...
+                    </>
+                  ) : (
+                    <>
+                      <Share2 className="w-3.5 h-3.5" />
+                      發佈轉折警報至 Chat 群組
+                    </>
+                  )}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* 4. 財務健康指數 */}
+      <div className="bg-slate-800 rounded-3xl border border-slate-700 overflow-hidden shadow-xl mb-4 flex flex-col transition-colors hover:border-slate-600">
+        <button
+          onClick={() => {
+            const nextState = !isFinancialHealthOpen;
+            setIsFinancialHealthOpen(nextState);
+            if (nextState && !report?.financialHealth && !financialHealthLoading) {
+              onFetchFinancialHealth();
+            }
+          }}
+          className="p-6 bg-slate-900/80 border-b border-slate-700 flex items-center justify-between w-full text-left cursor-pointer hover:bg-slate-800/80 transition-colors"
+        >
           <div className="flex items-center gap-3">
             <div className="p-2 bg-emerald-500/20 rounded-lg">
-              <TrendingUpIcon className="w-6 h-6 text-emerald-400" />
+              <Activity className="w-6 h-6 text-emerald-400" />
             </div>
             <h3 className="text-xl font-black text-white flex items-center gap-2">
-              新聞摘要與市場洞察
-              {!report?.newsInsight && !newsLoading && (
-                <span className="text-xs bg-indigo-500/20 text-indigo-300 font-bold px-2 py-1 rounded-md ml-2 border border-indigo-500/30">
-                  雙擊生成內容
+              財務健康指數
+              {report?.financialHealth && (
+                <span className={`text-xs font-bold px-2 py-0.5 rounded-full ${
+                  report.financialHealth.status === "強勁"
+                    ? "bg-emerald-500/20 text-emerald-400 animate-pulse"
+                    : "bg-rose-500/20 text-rose-400 animate-pulse"
+                }`}>
+                  評比: {report.financialHealth.status}
+                </span>
+              )}
+              {!report?.financialHealth && !financialHealthLoading && (
+                <span className="text-xs bg-indigo-500/10 text-indigo-300 font-bold px-2.5 py-1 rounded-md ml-2 border border-indigo-505/30 text-[10px]">
+                  打開才生成內容
                 </span>
               )}
             </h3>
           </div>
-          {newsLoading && (
-            <Loader2 className="w-5 h-5 text-emerald-400 animate-spin" />
-          )}
-        </div>
-        
-        {report?.newsInsight ? (
-          <div className="p-6 flex-1 flex flex-col gap-6 animate-in fade-in duration-300">
-            <div className="bg-slate-900/50 p-5 rounded-2xl border border-slate-700/50">
-              <h4 className="text-slate-400 text-xs font-black uppercase mb-3">
-                最新消息摘要
-              </h4>
-              <p className="text-slate-200 leading-relaxed font-medium">
-                {report.newsInsight.summary}
-              </p>
-            </div>
-
-            {report.newsInsight.comprehensiveAnalysis && (
-              <div className="bg-slate-900/50 p-5 rounded-2xl border border-rose-500/20 relative overflow-hidden">
-                <div className="absolute top-0 right-0 w-32 h-32 bg-rose-500/5 blur-3xl rounded-full" />
-                <h4 className="text-rose-400 text-xs font-black uppercase mb-3 flex items-center gap-2">
-                  <Activity className="w-4 h-4" /> 綜合分析
-                </h4>
-                <p className="text-slate-200 leading-relaxed font-medium relative z-10">
-                  {report.newsInsight.comprehensiveAnalysis}
-                </p>
-              </div>
+          <div className="flex items-center gap-2">
+            {financialHealthLoading && (
+              <Loader2 className="w-5 h-5 text-emerald-400 animate-spin mr-2" />
             )}
+            {isFinancialHealthOpen ? (
+              <ChevronUp className="w-5 h-5 text-slate-400" />
+            ) : (
+              <ChevronDown className="w-5 h-5 text-slate-400" />
+            )}
+          </div>
+        </button>
 
-            <div className="mt-auto">
-              <h4 className="text-slate-400 text-xs font-black uppercase mb-3">
-                關鍵驅動因素
-              </h4>
-              <div className="flex flex-wrap gap-2">
-                {report.newsInsight.keyDrivers?.map((tag, i) => (
-                  <span
-                    key={i}
-                    className="px-3 py-1.5 bg-slate-700/50 text-slate-300 rounded-lg text-sm font-bold border border-slate-600/50"
-                  >
-                    #{tag}
-                  </span>
-                ))}
-              </div>
+        <AnimatePresence>
+          {isFinancialHealthOpen && (
+            <motion.div
+              initial={{ height: 0, opacity: 0 }}
+              animate={{ height: "auto", opacity: 1 }}
+              exit={{ height: 0, opacity: 0 }}
+              className="overflow-hidden border-t border-slate-700"
+            >
+              {report?.financialHealth ? (
+                <div className="p-6 flex flex-col gap-6">
+                  {/* Status Banner */}
+                  <div className={`p-5 rounded-2xl border ${
+                    report.financialHealth.status === "強勁"
+                      ? "bg-emerald-950/20 border-emerald-500/20"
+                      : "bg-rose-950/20 border-rose-500/20"
+                  }`}>
+                    <div className="flex items-center gap-2 mb-3">
+                      <div className={`w-2 h-2 rounded-full ${
+                        report.financialHealth.status === "強勁" ? "bg-emerald-400 animate-pulse" : "bg-rose-400 animate-pulse"
+                      }`} />
+                      <h4 className="text-slate-200 text-xs font-black uppercase tracking-widest">
+                        總體財務健康度診斷：
+                        <span className={report.financialHealth.status === "強勁" ? "text-emerald-400 text-sm font-black" : "text-rose-400 text-sm font-black"}>
+                          {report.financialHealth.status}
+                        </span>
+                      </h4>
+                    </div>
+                    <p className="text-slate-200 leading-relaxed text-sm font-medium">
+                      {report.financialHealth.overview}
+                    </p>
+                  </div>
+
+                  {/* 6 metrics analysis */}
+                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                    <div className="bg-slate-900/50 p-5 rounded-2xl border border-slate-700/40 hover:border-slate-600 transition-colors">
+                      <h5 className="text-amber-400 text-xs font-black uppercase mb-2 flex items-center gap-1.5 font-bold">
+                        <TrendingUp className="w-3.5 h-3.5 mr-1" /> 收入增長 (Revenue Growth)
+                      </h5>
+                      <p className="text-slate-300 text-xs font-medium leading-relaxed">
+                        {report.financialHealth.metrics.revenueGrowth}
+                      </p>
+                    </div>
+
+                    <div className="bg-slate-900/50 p-5 rounded-2xl border border-slate-700/40 hover:border-slate-600 transition-colors">
+                      <h5 className="text-indigo-400 text-xs font-black uppercase mb-2 flex items-center gap-1.5 font-bold">
+                        <Activity className="w-3.5 h-3.5 mr-1" /> 淨利潤趨勢 (Net Profit Trend)
+                      </h5>
+                      <p className="text-slate-300 text-xs font-medium leading-relaxed">
+                        {report.financialHealth.metrics.netProfitTrend}
+                      </p>
+                    </div>
+
+                    <div className="bg-slate-900/50 p-5 rounded-2xl border border-slate-700/40 hover:border-slate-600 transition-colors">
+                      <h5 className="text-emerald-400 text-xs font-black uppercase mb-2 flex items-center gap-1.5 font-bold">
+                        <Wallet className="w-3.5 h-3.5 mr-1" /> 自由現金流 (Free Cash Flow)
+                      </h5>
+                      <p className="text-slate-300 text-xs font-medium leading-relaxed">
+                        {report.financialHealth.metrics.freeCashFlow}
+                      </p>
+                    </div>
+
+                    <div className="bg-slate-900/50 p-5 rounded-2xl border border-slate-700/40 hover:border-slate-600 transition-colors">
+                      <h5 className="text-teal-400 text-xs font-black uppercase mb-2 flex items-center gap-1.5 font-bold">
+                        <Scale className="w-3.5 h-3.5 mr-1" /> 利潤率 (Profit Margins)
+                      </h5>
+                      <p className="text-slate-300 text-xs font-medium leading-relaxed">
+                        {report.financialHealth.metrics.profitMargins}
+                      </p>
+                    </div>
+
+                    <div className="bg-slate-900/50 p-5 rounded-2xl border border-slate-700/40 hover:border-slate-600 transition-colors">
+                      <h5 className="text-rose-400 text-xs font-black uppercase mb-2 flex items-center gap-1.5 font-bold">
+                        <ShieldAlert className="w-3.5 h-3.5 mr-1" /> 債務水平 (Debt Levels)
+                      </h5>
+                      <p className="text-slate-300 text-xs font-medium leading-relaxed">
+                        {report.financialHealth.metrics.debtLevels}
+                      </p>
+                    </div>
+
+                    <div className="bg-slate-900/50 p-5 rounded-2xl border border-slate-700/40 hover:border-slate-600 transition-colors">
+                      <h5 className="text-cyan-400 text-xs font-black uppercase mb-2 flex items-center gap-1.5 font-bold">
+                        <ShieldCheck className="w-3.5 h-3.5 mr-1" /> 股本回報率 (Return on Equity)
+                      </h5>
+                      <p className="text-slate-300 text-xs font-medium leading-relaxed">
+                        {report.financialHealth.metrics.returnOnEquity}
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <div className="p-12 flex flex-col items-center justify-center text-center text-slate-500">
+                  <div className="bg-slate-900/50 w-16 h-16 rounded-2xl flex items-center justify-center mb-4 border border-slate-800 animate-pulse">
+                    <Bot className="w-8 h-8 text-emerald-500" />
+                  </div>
+                  <p className="font-bold text-slate-400 text-sm">
+                    {financialHealthLoading ? "正在聯網調取、比照過去 5 年財務數據與最新季度季報..." : "此區塊預設為閉合"}
+                    <span className="text-slate-500 text-xs font-medium mt-1 block">
+                      {financialHealthLoading ? "深度財務拆解預期需要 5-10 秒，請稍候..." : "點擊上方按鈕打開即自動聯網生成內容"}
+                    </span>
+                  </p>
+                </div>
+              )}
+            </motion.div>
+          )}
+        </AnimatePresence>
+      </div>
+
+      {/* 5. 風險分析指數 */}
+      <div className="bg-slate-800 rounded-3xl border border-slate-700 overflow-hidden shadow-xl mb-4 flex flex-col transition-colors hover:border-slate-600">
+        <button
+          onClick={() => {
+            const nextState = !isRiskAnalysisOpen;
+            setIsRiskAnalysisOpen(nextState);
+            if (nextState && !report?.riskAnalysis && !riskAnalysisLoading) {
+              onFetchRiskAnalysis();
+            }
+          }}
+          className="p-6 bg-slate-900/80 border-b border-slate-700 flex items-center justify-between w-full text-left cursor-pointer hover:bg-slate-800/80 transition-colors"
+        >
+          <div className="flex items-center gap-3">
+            <div className="p-2 bg-rose-500/20 rounded-lg">
+              <ShieldAlert className="w-6 h-6 text-rose-400" />
             </div>
+            <h3 className="text-xl font-black text-white flex items-center gap-2">
+              風險分析指數
+              {report?.riskAnalysis && (
+                <span className={`text-xs font-bold px-2 py-0.5 rounded-full ${
+                  report.riskAnalysis.riskLevel === "高"
+                    ? "bg-rose-500/20 text-rose-400 animate-pulse"
+                    : report.riskAnalysis.riskLevel === "觀察"
+                      ? "bg-amber-500/20 text-amber-400 animate-pulse"
+                      : "bg-emerald-500/20 text-emerald-400"
+                }`}>
+                  風險評估: {report.riskAnalysis.riskLevel}
+                </span>
+              )}
+              {!report?.riskAnalysis && !riskAnalysisLoading && (
+                <span className="text-xs bg-indigo-500/10 text-indigo-300 font-bold px-2.5 py-1 rounded-md ml-2 border border-indigo-505/30 text-[10px]">
+                  打開才生成內容
+                </span>
+              )}
+            </h3>
           </div>
-        ) : (
-          <div className="p-12 flex flex-col items-center justify-center text-center text-slate-500">
-            <div className="bg-slate-900/50 w-16 h-16 rounded-2xl flex items-center justify-center mb-4 border border-slate-800">
-              <Bot className="w-8 h-8 text-slate-600" />
-            </div>
-            <p className="font-medium text-slate-400">
-              此區塊預設為閉合<br />
-              <span className="text-slate-500 text-sm mt-1 inline-block">要等滑鼠雙擊打開後才生成內容</span>
-            </p>
+          <div className="flex items-center gap-2">
+            {riskAnalysisLoading && (
+              <Loader2 className="w-5 h-5 text-rose-400 animate-spin mr-2" />
+            )}
+            {isRiskAnalysisOpen ? (
+              <ChevronUp className="w-5 h-5 text-slate-400" />
+            ) : (
+              <ChevronDown className="w-5 h-5 text-slate-400" />
+            )}
           </div>
-        )}
+        </button>
+
+        <AnimatePresence>
+          {isRiskAnalysisOpen && (
+            <motion.div
+              initial={{ height: 0, opacity: 0 }}
+              animate={{ height: "auto", opacity: 1 }}
+              exit={{ height: 0, opacity: 0 }}
+              className="overflow-hidden border-t border-slate-700"
+            >
+              {report?.riskAnalysis ? (
+                <div className="p-6 flex flex-col gap-6">
+                  {/* Risks Priority list */}
+                  <div className="bg-slate-900/55 p-5 rounded-2xl border border-slate-700/50">
+                    <h4 className="text-slate-400 text-xs font-black uppercase mb-4 flex items-center gap-1.5 font-bold">
+                      <List className="w-4 h-4 text-rose-400" /> 核心投資威脅排序 (危險度由高到低)
+                    </h4>
+                    <div className="space-y-3">
+                      {report.riskAnalysis.risks.map((item, index) => (
+                        <div key={index} className="flex flex-col md:flex-row md:items-start gap-2.5 p-3 rounded-xl bg-slate-950/40 border border-slate-800/50">
+                          <div className="flex items-center justify-between shrink-0 md:w-44">
+                            <span className="text-xs font-black text-slate-200 flex items-center gap-1.5 font-bold">
+                              <span className="text-rose-500 font-mono font-bold">[{index + 1}]</span>
+                              {item.category}
+                            </span>
+                            <span className={`text-[10px] font-black px-2 py-0.5 rounded-md ${
+                              item.severity === "高"
+                                ? "bg-rose-500/25 text-rose-400 border border-rose-500/30"
+                                : item.severity === "中"
+                                  ? "bg-amber-500/25 text-amber-400 border border-amber-500/30"
+                                  : "bg-emerald-500/25 text-emerald-400 border border-emerald-500/30"
+                            }`}>
+                              {item.severity}風險
+                            </span>
+                          </div>
+                          <p className="text-slate-300 text-xs font-medium leading-relaxed flex-1 text-left">
+                            {item.description}
+                          </p>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Dual Analyst Debate */}
+                  <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 pb-2">
+                    {/* Bullish Case */}
+                    <div className="bg-emerald-950/10 p-5 rounded-2xl border border-emerald-500/20 relative overflow-hidden">
+                      <div className="absolute top-0 right-0 w-32 h-32 bg-emerald-500/5 blur-3xl rounded-full" />
+                      <h4 className="text-emerald-400 text-xs font-black uppercase mb-3 flex items-center gap-2 font-bold">
+                        <TrendingUp className="w-4 h-4" /> 看漲觀點「{report.riskAnalysis.debate.bullishAnalystName}」
+                      </h4>
+                      <ul className="space-y-2.5 relative z-10">
+                        {report.riskAnalysis.debate.bullishArguments.map((arg, i) => (
+                          <li key={i} className="flex gap-2 text-slate-300 text-xs font-medium leading-relaxed text-left">
+                            <span className="text-emerald-400 shrink-0 font-mono">✦</span>
+                            <span className="text-slate-200 font-medium">{arg}</span>
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+
+                    {/* Bearish Case */}
+                    <div className="bg-rose-950/10 p-5 rounded-2xl border border-rose-500/20 relative overflow-hidden">
+                      <div className="absolute top-0 right-0 w-32 h-32 bg-rose-500/5 blur-3xl rounded-full" />
+                      <h4 className="text-rose-400 text-xs font-black uppercase mb-3 flex items-center gap-2 font-bold">
+                        <TrendingDown className="w-4 h-4" /> 看跌觀點「{report.riskAnalysis.debate.bearishAnalystName}」
+                      </h4>
+                      <ul className="space-y-2.5 relative z-10">
+                        {report.riskAnalysis.debate.bearishArguments.map((arg, i) => (
+                          <li key={i} className="flex gap-2 text-slate-300 text-xs font-medium leading-relaxed text-left">
+                            <span className="text-rose-400 shrink-0 font-mono">✦</span>
+                            <span className="text-slate-200 font-medium">{arg}</span>
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  </div>
+
+                  {/* Balance Conclusion */}
+                  <div className="bg-slate-900/60 p-5 rounded-2xl border border-slate-800">
+                    <h4 className="text-slate-400 text-xs font-black uppercase mb-2 font-bold">多空綜合辯論結論</h4>
+                    <p className="text-slate-200 leading-relaxed text-sm font-semibold text-left">
+                      {report.riskAnalysis.debate.conclusion}
+                    </p>
+                  </div>
+                </div>
+              ) : (
+                <div className="p-12 flex flex-col items-center justify-center text-center text-slate-500">
+                  <div className="bg-slate-900/50 w-16 h-16 rounded-2xl flex items-center justify-center mb-4 border border-slate-800 animate-pulse">
+                    <Bot className="w-8 h-8 text-rose-500" />
+                  </div>
+                  <p className="font-bold text-slate-400 text-sm flex flex-col items-center justify-center">
+                    {riskAnalysisLoading ? "正在收集全球與行業挑戰，並生成兩大分析師多空辯點..." : "此區塊預設為閉合"}
+                    <span className="text-slate-500 text-xs font-medium mt-1 block">
+                      {riskAnalysisLoading ? "風險智能評析與多空對立論調擬定中，請稍候..." : "點擊上方按鈕打開即自動聯網生成內容"}
+                    </span>
+                  </p>
+                </div>
+              )}
+            </motion.div>
+          )}
+        </AnimatePresence>
       </div>
 
       {/* 6. Historical Data */}
@@ -3463,7 +5580,7 @@ const QuickStockHeader = ({ stockData }: { stockData: StockData }) => {
 
 const ScoreExplanationModal = ({ isOpen, onClose }: any) => {
   const [activeTab, setActiveTab] = useState<
-    "ai" | "buy" | "sell" | "qual" | "value" | "crash"
+    "ai" | "buy" | "sell" | "qual" | "value" | "crash" | "health" | "risk" | "pos" | "neg"
   >("ai");
 
   if (!isOpen) return null;
@@ -3475,6 +5592,10 @@ const ScoreExplanationModal = ({ isOpen, onClose }: any) => {
     { id: "qual", label: "品質評分 (Quality)" },
     { id: "value", label: "價值評分 (Value)" },
     { id: "crash", label: "歷史崩盤相似度 (Crash)" },
+    { id: "pos", label: "Positive Score" },
+    { id: "neg", label: "Negative Score" },
+    { id: "health", label: "財務健康指數" },
+    { id: "risk", label: "風險分析指數" },
   ] as const;
 
   const renderContent = () => {
@@ -3719,38 +5840,171 @@ const ScoreExplanationModal = ({ isOpen, onClose }: any) => {
             </ul>
           </div>
         );
+      case "health":
+        return (
+          <div className="space-y-4 text-slate-300 text-sm leading-relaxed px-1">
+            <h4 className="text-white font-bold text-base flex items-center gap-2">
+              <Activity className="w-5 h-5 text-emerald-400" /> 給 AI 的 Prompt 邏輯
+            </h4>
+            <ul className="list-disc pl-5 space-y-2">
+              <li>
+                要求 AI 搜尋該個股過去 5 年的財務數據，深度解構公司的核心財務維度。
+              </li>
+              <li>
+                必須完整考察 6 大核心指標：
+                <strong className="text-amber-400">收入增長</strong>、
+                <strong className="text-indigo-400">淨利潤趨勢</strong>、
+                <strong className="text-emerald-400">自由現金流</strong>、
+                <strong className="text-teal-400">利潤率</strong>、
+                <strong className="text-rose-400">債務水平</strong> 與 
+                <strong className="text-cyan-400">股本回報率 (ROE)</strong>。
+              </li>
+              <li>
+                將 5 年的長期趨勢與目前最新一個季度的季度財務數據進行重疊比照，確切評估這家公司的核心財務健康度。
+              </li>
+              <li>
+                最終判定為「衰退」或「強勁」兩大級別評比，幫助投資者洞察核心基本面是正在擴張還是步入下滑。
+              </li>
+            </ul>
+            <h4 className="text-white font-bold text-base flex items-center gap-2 mt-6">
+              <Database className="w-5 h-5 text-blue-400" /> 實際分析了哪些資料
+            </h4>
+            <ul className="list-disc pl-5 space-y-2">
+              <li>
+                <strong>年報/季報調取：</strong>自動檢索該企業過去 5 年的核心財務三表數據（損益表、資產負債表、現金流量表）。
+              </li>
+              <li>
+                <strong>利潤與回報率計算：</strong>評估毛淨利潤率是否承壓，以及股東權益回報率是否具備競爭力。
+              </li>
+              <li>
+                <strong>最新季度比照：</strong>比對最新季報中是否出現了營收加速、自由現金流創高或債務失控等轉折點。
+              </li>
+            </ul>
+          </div>
+        );
+      case "risk":
+        return (
+          <div className="space-y-4 text-slate-300 text-sm leading-relaxed px-1">
+            <h4 className="text-white font-bold text-base flex items-center gap-2">
+              <ShieldAlert className="w-5 h-5 text-rose-500" /> 給 AI 的 Prompt 邏輯
+            </h4>
+            <ul className="list-disc pl-5 space-y-2">
+              <li>
+                要求 AI 辨識並分析投資該股票面臨的最大核心危害與投資風險。
+              </li>
+              <li>
+                覆蓋關鍵的 6 大風險層面包括：
+                <strong>經濟風險</strong>、<strong>行業顛覆</strong>、<strong>競爭威脅</strong>、
+                <strong>監管法規風險</strong>、<strong>債務與財務風險</strong>、以及<strong>公司政策導向與挑戰</strong>。
+              </li>
+              <li>
+                將所有辨識到的核心風險點，按照其對股價和企業生存的「危險程度由高到低」進行嚴格的優先權排序。
+              </li>
+              <li>
+                最終輸出評分為三種級別：<span className="text-emerald-400 font-bold">低 (Low)</span>、
+                <span className="text-amber-400 font-bold">觀察 (Watch)</span>、
+                <span className="text-rose-400 font-bold">高 (High)</span>。
+              </li>
+              <li>
+                並特別創建兩大頂尖分析師論證辯壇：一位看漲，一位看跌，雙方必須各司其職，提供充足的數據和行業統計，最後並得出看漲或看跌的其中之一的結論。
+              </li>
+            </ul>
+            <h4 className="text-white font-bold text-base flex items-center gap-2 mt-6">
+              <Database className="w-5 h-5 text-blue-400" /> 實際分析了哪些資料
+            </h4>
+            <ul className="list-disc pl-5 space-y-2">
+              <li>
+                <strong>外部多重挑戰：</strong>聯網檢索有關新替代品、競爭對手攻勢、行業新規與高負債財務警報等風險內容。
+              </li>
+              <li>
+                <strong>分析師多空博弈：</strong>搜集市場最前沿的多空雙方論據與數據模型，擬定邏輯嚴密且相互對立的辯論點。
+              </li>
+            </ul>
+          </div>
+        );
+      case "pos":
+        return (
+          <div className="space-y-4 text-slate-300 text-sm leading-relaxed px-1">
+            <h4 className="text-white font-bold text-base flex items-center gap-2">
+              <ArrowUpRight className="w-5 h-5 text-emerald-400" /> Positive Score (多頭力道加總) 計算方式
+            </h4>
+            <ul className="list-disc pl-5 space-y-2">
+              <li>
+                <strong>量化公式：</strong>
+                <code className="text-emerald-400 font-mono text-xs block my-1 bg-slate-900 px-3 py-2 rounded border border-slate-850">
+                  Positive Score = calc(AI綜合評分) + calc(品質評分) + calc(價值評分) + Buy Score
+                </code>
+                其中，各項評分的 <code className="text-amber-400 font-mono">calc(Score)</code> 運算邏輯為：若原始分數大於 5 分，則保留超出 5 分的部分（即 <code className="text-emerald-400 font-mono">Score - 5</code>），小於等於 5 分時則以 0 分計。
+              </li>
+              <li>
+                <strong>運作原理：</strong>
+                主要在量化個股「超越平均水準 (5分)」的多頭優勢。當 AI評分、企業品質、估值合規性個別優於基準線時，其超越基準差值會與當前的 Buy Score (買進評分) 直接加總，形成強力的多頭共振力道衡量指標。
+              </li>
+              <li>
+                <strong>數值解讀：</strong>
+                分數越高，代表個股在基本面品質、內在價值評比及 Socrates AI 整體分析面上，所匯聚的多頭信心與加碼力道越是顯著、飽滿且全面。
+              </li>
+            </ul>
+          </div>
+        );
+      case "neg":
+        return (
+          <div className="space-y-4 text-slate-300 text-sm leading-relaxed px-1">
+            <h4 className="text-white font-bold text-base flex items-center gap-2">
+              <ArrowDownRight className="w-5 h-5 text-rose-500" /> Negative Score (空頭力道加總) 計算方式
+            </h4>
+            <ul className="list-disc pl-5 space-y-2">
+              <li>
+                <strong>量化公式：</strong>
+                <code className="text-rose-400 font-mono text-xs block my-1 bg-slate-900 px-3 py-2 rounded border border-slate-850">
+                  Negative Score = calc(AI綜合評分) + calc(品質評分) + calc(價值評分) + Sell Score
+                </code>
+                其中，各項評分的 <code className="text-amber-400 font-mono">calc(Score)</code> 運算邏輯為：若原始分數小於 5 分，則計算落後 5 分的差距部分（即 <code className="text-rose-400 font-mono">5 - Score</code>），大於等於 5 分時則以 0 分計。
+              </li>
+              <li>
+                <strong>運作原理：</strong>
+                用於判定資產「低於平均值 (5分)」的弱勢或下行風險程度。當 AI綜合評分、基本面財報、內在價值個別惡化並下滑至過低水準時，與過半基準的負偏離將會被轉換為正向的風險點數累計，進而與 Sell Score (賣點評分) 直接加總。
+              </li>
+              <li>
+                <strong>數值解讀：</strong>
+                分數越高，代表個股在多個重要分析維度中的空頭風險與回調警戒訊號越趨於集中、強烈，提示投資人更應注重防禦、止損或規避。
+              </li>
+            </ul>
+          </div>
+        );
     }
   };
 
   return (
-    <div className="fixed inset-0 z-[200] flex items-center justify-center p-4">
+    <div className="fixed inset-0 z-[200] flex items-center justify-center p-3 sm:p-4 animate-fade-in">
       <div
-        className="absolute inset-0 bg-black/60 backdrop-blur-sm"
+        className="absolute inset-0 bg-black/75 backdrop-blur-sm"
         onClick={onClose}
       />
-      <div className="bg-slate-900 w-full max-w-3xl rounded-2xl border border-slate-700 p-6 shadow-2xl flex flex-col max-h-[85vh] relative z-10 animate-in fade-in zoom-in-95 duration-200">
-        <div className="flex justify-between items-center mb-6">
-          <h3 className="text-xl font-black text-white flex items-center gap-2">
-            <Info className="w-6 h-6 text-amber-500" />
-            AI 評分與分析邏輯說明
+      <div className="bg-slate-900 w-full max-w-3xl rounded-2xl border border-slate-700/70 p-4 sm:p-6 shadow-2xl flex flex-col max-h-[92vh] sm:max-h-[85vh] relative z-10 animate-in fade-in zoom-in-95 duration-200">
+        <div className="flex justify-between items-center mb-4 sm:mb-5 shrink-0">
+          <h3 className="text-base sm:text-lg md:text-xl font-black text-white flex items-center gap-2">
+            <Info className="w-5 h-5 sm:w-6 sm:h-6 text-amber-500 shrink-0" />
+            <span>AI 評分與分析邏輯說明</span>
           </h3>
           <button
             onClick={onClose}
             className="text-slate-400 hover:text-white transition-colors bg-slate-800 p-1.5 rounded-lg"
           >
-            <X className="w-5 h-5" />
+            <X className="w-4 h-4 sm:w-5 sm:h-5" />
           </button>
         </div>
 
-        <div className="flex flex-wrap gap-2 mb-6 border-b border-slate-800 pb-2">
+        {/* Tab Selection: Structured grid on mobile to keep items uniform, beautifully rendering into flex row on desktop */}
+        <div className="grid grid-cols-2 sm:grid-cols-3 md:flex md:flex-wrap gap-1.5 sm:gap-2 mb-4 border-b border-slate-800 pb-3 shrink-0">
           {tabs.map((tab) => (
             <button
               key={tab.id}
               onClick={() => setActiveTab(tab.id)}
-              className={`px-4 py-2.5 rounded-lg text-sm font-bold transition-all duration-200 ${
+              className={`px-2 py-1.5 sm:px-3 sm:py-2.5 rounded-lg text-[10px] sm:text-xs md:text-sm font-bold transition-all duration-200 text-center flex items-center justify-center border leading-tight ${
                 activeTab === tab.id
-                  ? "bg-amber-600/20 text-amber-500 border border-amber-600/30 shadow-inner"
-                  : "text-slate-400 hover:text-slate-200 hover:bg-slate-800 border border-transparent"
+                  ? "bg-amber-600/20 text-amber-500 border-amber-600/40 shadow-inner"
+                  : "text-slate-400 hover:text-slate-200 hover:bg-slate-800 border-transparent"
               }`}
             >
               {tab.label}
@@ -3758,16 +6012,16 @@ const ScoreExplanationModal = ({ isOpen, onClose }: any) => {
           ))}
         </div>
 
-        <div className="overflow-y-auto flex-1 custom-scrollbar pr-2 pb-4">
-          <div className="bg-slate-950 rounded-xl p-5 border border-slate-800/50 shadow-inner min-h-[300px]">
+        <div className="overflow-y-auto flex-1 custom-scrollbar pr-1 pb-2 scroll-smooth">
+          <div className="bg-slate-950 rounded-xl p-3.5 sm:p-5 border border-slate-800/50 shadow-inner min-h-[180px] sm:min-h-[300px]">
             {renderContent()}
           </div>
         </div>
 
-        <div className="mt-4 pt-4 border-t border-slate-800 flex justify-end">
+        <div className="mt-4 pt-3 border-t border-slate-800 flex justify-end shrink-0">
           <button
             onClick={onClose}
-            className="px-6 py-2.5 bg-slate-800 hover:bg-slate-700 text-white rounded-xl font-bold transition-colors"
+            className="px-5 py-2 sm:px-6 sm:py-2.5 bg-slate-800 hover:bg-slate-705 text-white rounded-xl text-xs sm:text-sm font-bold transition-colors"
           >
             了解
           </button>
@@ -3787,6 +6041,7 @@ const GoogleDriveModal = ({
   trades = [],
   watchlist = [],
   onLoadBackup,
+  isLoggingIn,
 }: any) => {
   const [backups, setBackups] = useState<any[]>([]);
   const [loadingBackups, setLoadingBackups] = useState(false);
@@ -3794,6 +6049,35 @@ const GoogleDriveModal = ({
   const [backupSuccessMessage, setBackupSuccessMessage] = useState("");
   const [restoreSuccessMessage, setRestoreSuccessMessage] = useState("");
   const [errorMessage, setErrorMessage] = useState("");
+
+  // Custom non-blocking restore confirmation to bypass sandbox browser limitations
+  const [confirmRestoreFile, setConfirmRestoreFile] = useState<{ id: string; name: string } | null>(null);
+
+  // --- Google Sheets Syncing states & handler ---
+  const [isSyncingSheets, setIsSyncingSheets] = useState(false);
+  const [sheetsSuccessMessage, setSheetsSuccessMessage] = useState("");
+  const [syncedSpreadsheetUrl, setSyncedSpreadsheetUrl] = useState<string | null>(() => {
+    return localStorage.getItem("ecm_synced_spreadsheet_url") || null;
+  });
+
+  const handleSyncSheets = async () => {
+    if (!token) return;
+    setIsSyncingSheets(true);
+    setSheetsSuccessMessage("");
+    setErrorMessage("");
+    try {
+      const result = await workspace.createAndSyncGoogleSheet(token, trades, watchlist);
+      setSyncedSpreadsheetUrl(result.spreadsheetUrl);
+      localStorage.setItem("ecm_synced_spreadsheet_url", result.spreadsheetUrl);
+      setSheetsSuccessMessage("成功創立並同步至 Google 試算表（交易史與隨身清單）！");
+      setTimeout(() => setSheetsSuccessMessage(""), 5000);
+    } catch (err: any) {
+      console.error(err);
+      setErrorMessage("試算表同步失敗，請確認是否已對 Google 試算表授權。");
+    } finally {
+      setIsSyncingSheets(false);
+    }
+  };
 
   useEffect(() => {
     if (isOpen && token) {
@@ -3822,12 +6106,29 @@ const GoogleDriveModal = ({
     setBackupSuccessMessage("");
     setErrorMessage("");
     try {
+      // Package comprehensive watchlist details including scores, recommendations, and update timestamps
       const backupData = {
+        watchlist: watchlist.map((w: any) => ({
+          symbol: w.symbol || "",
+          name: w.name || "",
+          price: w.price ?? 0,
+          changePercent: w.changePercent ?? 0,
+          timestamp: w.timestamp || Date.now(),
+          buyScore: w.buyScore ?? null,
+          sellScore: w.sellScore ?? null,
+          qualityScore: w.qualityScore ?? null,
+          valueScore: w.valueScore ?? null,
+          crashSimilarityScore: w.crashSimilarityScore ?? null,
+          posScore: w.posScore ?? 0,
+          negScore: w.negScore ?? 0,
+          aiScore: w.aiScore ?? null,
+          action: w.action || "Neutral",
+          history: w.history || [],
+        })),
         trades,
-        watchlist,
         backedUpAt: new Date().toISOString(),
       };
-      const fileName = `Socrates_Portfolio_Backup_${new Date().toISOString().slice(0, 10)}_${Math.floor(Date.now() / 1000)}.json`;
+      const fileName = `Socrates_Watchlist_Backup_${new Date().toISOString().slice(0, 10)}_${Math.floor(Date.now() / 1000)}.json`;
       await gdrive.uploadFileToGoogleDrive(
         token,
         fileName,
@@ -3835,7 +6136,7 @@ const GoogleDriveModal = ({
         JSON.stringify(backupData, null, 2),
         "Socrates_ECM_Backup",
       );
-      setBackupSuccessMessage("成功將帳戶與觀察清單備份至雲端硬碟！");
+      setBackupSuccessMessage("成功將觀察清單指標數據（個股、評分、更新日期與歷史）備份至雲端硬碟！");
       setTimeout(() => setBackupSuccessMessage(""), 5000);
       fetchBackups();
     } catch (err: any) {
@@ -3848,10 +6149,6 @@ const GoogleDriveModal = ({
 
   const handleRestore = async (fileId: string, fileName: string) => {
     if (!token) return;
-    const confirmRestore = window.confirm(
-      `確認要從備份檔案「${fileName}」還原嗎？這將覆蓋您目前的交易和觀察清單。`,
-    );
-    if (!confirmRestore) return;
 
     setLoadingBackups(true);
     setRestoreSuccessMessage("");
@@ -3914,33 +6211,44 @@ const GoogleDriveModal = ({
             {/* Styled "Sign in with Google" button */}
             <button
               onClick={onLogin}
-              className="flex items-center gap-3 bg-white text-slate-900 px-6 py-3 rounded-xl font-bold hover:bg-slate-100 transition-colors shadow-lg"
+              disabled={isLoggingIn}
+              className={`flex items-center gap-3 bg-white text-slate-900 px-6 py-3 rounded-xl font-bold hover:bg-slate-100 transition-colors shadow-lg ${isLoggingIn ? "opacity-50 cursor-not-allowed" : ""}`}
             >
-              <svg
-                version="1.1"
-                xmlns="http://www.w3.org/2000/svg"
-                viewBox="0 0 48 48"
-                className="w-5 h-5"
-              >
-                <path
-                  fill="#EA4335"
-                  d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"
-                ></path>
-                <path
-                  fill="#4285F4"
-                  d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"
-                ></path>
-                <path
-                  fill="#FBBC05"
-                  d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"
-                ></path>
-                <path
-                  fill="#34A853"
-                  d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"
-                ></path>
-              </svg>
-              Sign in with Google
+              {isLoggingIn ? (
+                <div className="w-5 h-5 border-2 border-slate-900 border-t-transparent rounded-full animate-spin" />
+              ) : (
+                <svg
+                  version="1.1"
+                  xmlns="http://www.w3.org/2000/svg"
+                  viewBox="0 0 48 48"
+                  className="w-5 h-5"
+                >
+                  <path
+                    fill="#EA4335"
+                    d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"
+                  ></path>
+                  <path
+                    fill="#4285F4"
+                    d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"
+                  ></path>
+                  <path
+                    fill="#FBBC05"
+                    d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"
+                  ></path>
+                  <path
+                    fill="#34A853"
+                    d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"
+                  ></path>
+                </svg>
+              )}
+              {isLoggingIn ? "登入中..." : "Sign in with Google"}
             </button>
+
+            {/* Sandbox iframe friendly alert line */}
+            <div className="mt-6 text-[11px] text-amber-500/90 bg-amber-500/5 p-3.5 rounded-xl border border-amber-500/10 max-w-sm text-center font-sans tracking-wide leading-relaxed">
+              💡 <b>微網誌/預覽視窗登入提示：</b><br />
+              因瀏覽器安全性限制，若登入彈出視窗被封鎖或未回應，請點擊外層右上角<b>「在新分頁中開啟 (Open in a new tab)」</b>即可順利完成驗證！
+            </div>
           </div>
         ) : (
           <div className="flex-1 flex flex-col min-h-0 space-y-6">
@@ -3982,7 +6290,7 @@ const GoogleDriveModal = ({
                     建立新備份
                   </h4>
                   <p className="text-xs text-slate-500">
-                    將最新的交易倉位與觀察清單存至雲端硬碟中
+                    備份最新觀察名單（含個股、各項評分、狀態指標與更新日期歷史）
                   </p>
                 </div>
                 <button
@@ -4014,6 +6322,59 @@ const GoogleDriveModal = ({
                 <div className="bg-rose-500/10 text-rose-400 p-3 rounded-xl border border-rose-500/20 text-xs font-bold animate-fade-in flex items-center gap-2">
                   <AlertTriangle className="w-4 h-3.5" />
                   {errorMessage}
+                </div>
+              )}
+            </div>
+
+            {/* Google Sheets Sync Card */}
+            <div className="bg-slate-950/40 p-4 rounded-xl border border-slate-800 flex flex-col gap-3">
+              <div className="flex items-center justify-between">
+                <div>
+                  <h4 className="text-white text-sm font-black uppercase flex items-center gap-1.5 text-left">
+                    <Database className="w-4 h-4 text-emerald-400" />
+                    Google Sheets 實時交易帳簿
+                  </h4>
+                  <p className="text-[11px] text-slate-500 text-left">
+                    建立並同步 Socrates 雲端試算表（整合所有的交易歷史與自訂隨身清單）
+                  </p>
+                </div>
+                <button
+                  onClick={handleSyncSheets}
+                  disabled={isSyncingSheets}
+                  className="flex items-center gap-2 bg-emerald-600 hover:bg-emerald-500 text-white font-bold py-2 px-3.5 rounded-xl transition-colors disabled:opacity-50 text-xs shadow-md"
+                >
+                  {isSyncingSheets ? (
+                    <>
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      同步中...
+                    </>
+                  ) : (
+                    <>
+                      <Plus className="w-3.5 h-3.5" />
+                      同步
+                    </>
+                  )}
+                </button>
+              </div>
+
+              {sheetsSuccessMessage && (
+                <div className="bg-emerald-500/10 text-emerald-400 p-2.5 rounded-lg border border-emerald-500/20 text-xs font-bold flex items-center gap-1.5 animate-in fade-in">
+                  <CheckCircle className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                  {sheetsSuccessMessage}
+                </div>
+              )}
+
+              {syncedSpreadsheetUrl && (
+                <div className="flex items-center justify-between bg-emerald-500/10 border border-emerald-500/20 p-2 text-left rounded-lg text-xs animate-in fade-in">
+                  <span className="text-emerald-300 font-bold">已同步試算表：</span>
+                  <a
+                    href={syncedSpreadsheetUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="flex items-center gap-1 text-white underline hover:text-emerald-400 font-bold"
+                  >
+                    開啟 Google 試算表 <ExternalLink className="w-3 h-3" />
+                  </a>
                 </div>
               )}
             </div>
@@ -4073,7 +6434,7 @@ const GoogleDriveModal = ({
                           </div>
                         </div>
                         <button
-                          onClick={() => handleRestore(bak.id, bak.name)}
+                          onClick={() => setConfirmRestoreFile({ id: bak.id, name: bak.name })}
                           className="flex items-center gap-1.5 shrink-0 bg-slate-800 hover:bg-amber-600/20 text-slate-300 hover:text-amber-500 font-bold text-xs py-1.5 px-3 rounded-lg border border-slate-700 hover:border-amber-500/30 transition-all"
                         >
                           <CloudDownload className="w-3.5 h-3.5" />
@@ -4093,6 +6454,41 @@ const GoogleDriveModal = ({
           在 Google Drive 中建立對應的 Socrates_ECM_Backup / Socrates_ECM_Reports
           專用資料夾。
         </div>
+
+        {confirmRestoreFile && (
+          <div className="fixed inset-0 z-[230] flex items-center justify-center p-4 animate-fade-in font-sans">
+            <div className="absolute inset-0 bg-black/80 backdrop-blur-xs" onClick={() => setConfirmRestoreFile(null)} />
+            <div className="bg-slate-900 border border-slate-700 p-6 rounded-2xl shadow-2xl max-w-sm w-full relative z-30 transform scale-100 transition-all duration-150">
+              <h4 className="text-base font-black text-white mb-2 flex items-center gap-1.5">
+                <CloudDownload className="w-5 h-5 text-amber-500 animate-bounce" />
+                確認還原備份
+              </h4>
+              <p className="text-xs text-slate-300 mb-6 font-medium leading-relaxed text-left">
+                確認要從備份檔案「<span className="text-amber-500 font-mono font-bold break-all">{confirmRestoreFile.name}</span>」還原嗎？<br /><br />
+                <span className="text-rose-455 font-black">⚠️ 警告：這將會完全覆蓋您目前的的所有交易與觀察清單資料。</span>
+              </p>
+              <div className="flex gap-3 justify-end">
+                <button
+                  type="button"
+                  onClick={() => setConfirmRestoreFile(null)}
+                  className="px-4 py-2 bg-slate-800 hover:bg-slate-750 text-slate-300 rounded-xl text-xs font-bold transition-all border border-slate-750"
+                >
+                  取消
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    handleRestore(confirmRestoreFile.id, confirmRestoreFile.name);
+                    setConfirmRestoreFile(null);
+                  }}
+                  className="px-4 py-2 bg-amber-650 hover:bg-amber-500 text-white rounded-xl text-xs font-bold transition-all shadow-md shadow-amber-900/20"
+                >
+                  確定還原
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -4110,11 +6506,32 @@ const App = () => {
   const [quickLoading, setQuickLoading] = useState(false);
   const [quickLoadingProgress, setQuickLoadingProgress] = useState("");
   const [quickResults, setQuickResults] = useState<StockData[]>([]);
-  const [viewTab, setViewTab] = useState<"screener" | "report">("report");
+  const [viewTab, setViewTab] = useState<"screener" | "report" | "screenerWatchlist" | "macroFilter" | "alphaMatrix" | "portfolio">("report");
+  const [selectedScreenerItems, setSelectedScreenerItems] = useState<ScreenerItem[]>(() => {
+    const s = localStorage.getItem("ecm_screener_watchlist");
+    return s ? JSON.parse(s) : [];
+  });
+  
+  useEffect(() => {
+    localStorage.setItem("ecm_screener_watchlist", JSON.stringify(selectedScreenerItems));
+  }, [selectedScreenerItems]);
+
+  const toggleScreenerItem = useCallback((item: ScreenerItem) => {
+    setSelectedScreenerItems(prev => {
+      if (prev.some(i => i.symbol === item.symbol)) {
+        return prev.filter(i => i.symbol !== item.symbol);
+      } else {
+        return [...prev, item];
+      }
+    });
+  }, []);
+
   const [reports, setReports] = useState<Record<string, StockReport>>({});
   const report = stockData ? reports[stockData.symbol] || null : null;
   const [reportLoading, setReportLoading] = useState(false);
   const [newsLoading, setNewsLoading] = useState(false);
+  const [financialHealthLoading, setFinancialHealthLoading] = useState(false);
+  const [riskAnalysisLoading, setRiskAnalysisLoading] = useState(false);
   const [trades, setTrades] = useState<Trade[]>(() => {
     const s = localStorage.getItem("ecm_trades");
     return s ? JSON.parse(s) : [];
@@ -4125,12 +6542,125 @@ const App = () => {
   });
   const [showPortfolio, setShowPortfolio] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  const [updatingWatchlist, setUpdatingWatchlist] = useState(false);
+  const [watchlistUpdateProgress, setWatchlistUpdateProgress] = useState("");
+
+  const [showWatchlistExportModal, setShowWatchlistExportModal] = useState(false);
+  const [showWatchlistImportModal, setShowWatchlistImportModal] = useState(false);
+  const [watchlistCloudLoading, setWatchlistCloudLoading] = useState(false);
+
+  const handleImportSelected = useCallback(() => {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = ".json";
+    input.onchange = (e: any) => {
+      const file = e.target.files?.[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        try {
+          const json = JSON.parse(e.target?.result as string);
+          if (Array.isArray(json)) {
+            setSelectedScreenerItems(json);
+            alert("匯入成功！");
+          }
+        } catch (err) {
+          alert("無效的 JSON 檔案");
+        }
+      };
+      reader.readAsText(file);
+    };
+    input.click();
+  }, []);
+
+  const handleExportSelected = useCallback(() => {
+    const blob = new Blob([JSON.stringify(selectedScreenerItems, null, 2)], {
+      type: "application/json",
+    });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    const d = new Date();
+    const ds = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}_${String(d.getHours()).padStart(2,'0')}-${String(d.getMinutes()).padStart(2,'0')}`;
+    a.download = `socrates_selected_${ds}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }, [selectedScreenerItems]);
+
+  const handleDriveExportSelected = async () => {
+    if (!gdToken) {
+      alert("請先登入 Google Drive");
+      setShowGoogleDrive(true);
+      return;
+    }
+    setWatchlistCloudLoading(true);
+    try {
+      const gdrive = await import("./googleDrive");
+      const blob = new Blob([JSON.stringify(selectedScreenerItems, null, 2)], {
+        type: "application/json",
+      });
+      const d = new Date();
+      const ds = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}_${String(d.getHours()).padStart(2, "0")}-${String(d.getMinutes()).padStart(2, "0")}`;
+      const fileName = `socrates_selected_${ds}.json`;
+      
+      await gdrive.uploadFileToGoogleDrive(
+        gdToken,
+        fileName,
+        "application/json",
+        blob,
+        "Socrates_Screener_Watchlist"
+      );
+      alert(`精選名單已成功備份至 Google Drive 的「Socrates_Screener_Watchlist」資料夾中！檔案名稱為：\n${fileName}`);
+      setShowWatchlistExportModal(false);
+    } catch (err) {
+      console.error(err);
+      alert("備份至 Google Drive 失敗");
+    } finally {
+      setWatchlistCloudLoading(false);
+    }
+  };
+
+  const handleDriveImportSelected = async () => {
+    if (!gdToken) {
+      alert("請先登入 Google Drive");
+      setShowGoogleDrive(true);
+      return;
+    }
+    setWatchlistCloudLoading(true);
+    try {
+      const gdrive = await import("./googleDrive");
+      const files = await gdrive.listBackupFilesFromGoogleDrive(gdToken, "Socrates_Screener_Watchlist");
+      if (!files || files.length === 0) {
+        alert("在 Google Drive 中找不到備份檔案");
+        return;
+      }
+      
+      // select the newest file (assuming they are named with timestamps)
+      const latestFile = files[0];
+      const jsonStr = await gdrive.downloadFileFromGoogleDrive(gdToken, latestFile.id);
+      
+      const json = JSON.parse(jsonStr);
+      if (Array.isArray(json)) {
+        setSelectedScreenerItems(json);
+        alert(`已成功從 Google Drive 匯入資料 (檔案: ${latestFile.name})`);
+        setShowWatchlistImportModal(false);
+      } else {
+        alert("資料格式無效");
+      }
+    } catch (err) {
+      console.error(err);
+      alert("從 Google Drive 匯入失敗");
+    } finally {
+      setWatchlistCloudLoading(false);
+    }
+  };
 
   // Google Drive state
   const [gdUser, setGdUser] = useState<any>(null);
   const [gdToken, setGdToken] = useState<string | null>(null);
   const [showGoogleDrive, setShowGoogleDrive] = useState(false);
   const [isSavingToDrive, setIsSavingToDrive] = useState(false);
+  const [isLoggingIn, setIsLoggingIn] = useState(false);
 
   useEffect(() => {
     const unsub = gdrive.initAuth(
@@ -4146,16 +6676,158 @@ const App = () => {
     return () => unsub();
   }, []);
 
+  // Firestore Helper Functions with strict operational error handlers
+  const cleanForFirestore = (obj: any): any => {
+    if (obj === null || obj === undefined) return null;
+    if (Array.isArray(obj)) {
+      return obj.map(item => cleanForFirestore(item));
+    }
+    if (typeof obj === 'object') {
+      const cleaned: any = {};
+      for (const key of Object.keys(obj)) {
+        if (obj[key] !== undefined) {
+          cleaned[key] = cleanForFirestore(obj[key]);
+        }
+      }
+      return cleaned;
+    }
+    return obj;
+  };
+
+  const saveTradeToFirestore = async (userId: string, trade: Trade) => {
+    const path = `users/${userId}/trades`;
+    try {
+      const docRef = doc(db, path, trade.id);
+      await setDoc(docRef, cleanForFirestore({
+        ...trade,
+        userId
+      }));
+    } catch (err) {
+      handleFirestoreError(err, OperationType.WRITE, `${path}/${trade.id}`);
+    }
+  };
+
+  const deleteTradeFromFirestore = async (userId: string, tradeId: string) => {
+    const path = `users/${userId}/trades`;
+    try {
+      const docRef = doc(db, path, tradeId);
+      await deleteDoc(docRef);
+    } catch (err) {
+      handleFirestoreError(err, OperationType.DELETE, `${path}/${tradeId}`);
+    }
+  };
+
+  const saveWatchlistItemToFirestore = async (userId: string, item: WatchlistItem) => {
+    const path = `users/${userId}/watchlist`;
+    try {
+      const docRef = doc(db, path, item.symbol);
+      await setDoc(docRef, cleanForFirestore({
+        ...item,
+        userId
+      }));
+    } catch (err) {
+      handleFirestoreError(err, OperationType.WRITE, `${path}/${item.symbol}`);
+    }
+  };
+
+  const deleteWatchlistItemFromFirestore = async (userId: string, symbol: string) => {
+    const path = `users/${userId}/watchlist`;
+    try {
+      const docRef = doc(db, path, symbol);
+      await deleteDoc(docRef);
+    } catch (err) {
+      handleFirestoreError(err, OperationType.DELETE, `${path}/${symbol}`);
+    }
+  };
+
+  const syncFromFirestore = async (userId: string) => {
+    try {
+      const tradesPath = `users/${userId}/trades`;
+      const watchlistPath = `users/${userId}/watchlist`;
+
+      // 1. Fetch trades from Firestore
+      let fetchedTrades: Trade[] = [];
+      try {
+        const tradesSnap = await getDocs(collection(db, tradesPath));
+        tradesSnap.forEach((doc) => {
+          fetchedTrades.push(doc.data() as Trade);
+        });
+      } catch (err) {
+        handleFirestoreError(err, OperationType.GET, tradesPath);
+      }
+
+      // 2. Fetch watchlist items from Firestore
+      let fetchedWatchlist: WatchlistItem[] = [];
+      try {
+        const watchSnap = await getDocs(collection(db, watchlistPath));
+        watchSnap.forEach((doc) => {
+          fetchedWatchlist.push(doc.data() as WatchlistItem);
+        });
+      } catch (err) {
+        handleFirestoreError(err, OperationType.GET, watchlistPath);
+      }
+
+      // 3. Merging logic
+      if (fetchedTrades.length > 0) {
+        setTrades(fetchedTrades);
+        localStorage.setItem("ecm_trades", JSON.stringify(fetchedTrades));
+      } else {
+        // If Firestore is empty, upload standard offline local trades
+        const localTrades = JSON.parse(localStorage.getItem("ecm_trades") || "[]");
+        if (localTrades.length > 0) {
+          for (const t of localTrades) {
+            await saveTradeToFirestore(userId, t);
+          }
+        }
+      }
+
+      if (fetchedWatchlist.length > 0) {
+        setWatchlist(fetchedWatchlist);
+        localStorage.setItem("ecm_watchlist", JSON.stringify(fetchedWatchlist));
+      } else {
+        // If Firestore is empty, upload standard offline local watchlist items
+        const localWatchlist = JSON.parse(localStorage.getItem("ecm_watchlist") || "[]");
+        if (localWatchlist.length > 0) {
+          for (const w of localWatchlist) {
+            await saveWatchlistItemToFirestore(userId, w);
+          }
+        }
+      }
+    } catch (err) {
+      console.error("Firestore sync fail on login:", err);
+    }
+  };
+
+  // Sync with Firestore whenever user signs in
+  useEffect(() => {
+    if (gdUser) {
+      syncFromFirestore(gdUser.uid);
+    }
+  }, [gdUser]);
+
   const handleGoogleDriveLogin = async () => {
+    if (isLoggingIn) return;
+    setIsLoggingIn(true);
     try {
       const result = await gdrive.googleSignIn();
       if (result) {
         setGdUser(result.user);
         setGdToken(result.accessToken);
       }
-    } catch (err) {
+    } catch (err: any) {
       console.error(err);
-      alert("登入 Google 雲端硬碟失敗，請重試。");
+      const errorCode = err?.code || "";
+      const errorMsg = err?.message || "";
+      if (
+        errorCode !== "auth/cancelled-popup-request" &&
+        errorCode !== "auth/popup-closed-by-user" &&
+        !errorMsg.includes("cancelled-popup-request") &&
+        !errorMsg.includes("popup-closed-by-user")
+      ) {
+        alert("登入 Google 帳號失敗，請重試。");
+      }
+    } finally {
+      setIsLoggingIn(false);
     }
   };
 
@@ -4505,7 +7177,7 @@ const App = () => {
         setError("未能成功分析任何標的。");
       }
     } catch (err: any) {
-      setError(err.message || "分析失敗");
+      setError(getQuotaErrorMessage(err.message || err.toString() || "分析失敗"));
     } finally {
       setLoading(false);
       setLoadingProgress("");
@@ -4612,94 +7284,154 @@ const App = () => {
       const prompt = `${getCurrentDateContext()} Generate a comprehensive trading report for "${targetStock.symbol}" (${targetStock.name}) based on Martin Armstrong's Socrates ECM model.
       
       The report must include:
-      1. A structured daily trading plan (Pre-market, Opening, Midday, Closing).
-      2. A simulated backtest of the Socrates ECM strategy on this stock (Win rate, Profit factor, Max drawdown, improvements).
+      A simulated backtest of the Socrates ECM strategy on this stock (Win rate, Profit factor, Max drawdown, improvements).
 
-      CRITICAL: All descriptive text (summary, action, checklist, positioning, improvements, keyDrivers) MUST be in Traditional Chinese (繁體中文).
+      CRITICAL: All descriptive text (summary, action, checklist, positioning, improvementsBase, overview, extraPlanOverview, actionDetails, triggerCondition) MUST be in Traditional Chinese (繁體中文).
       Based on the asset context, determine if the strategy should be 'Buy', 'Short', or 'Wait'.
       If Buy, generate buy entry conditions. If Short, generate short-sell entry conditions.
-      For the 4 entry batches, please provide exact allocations (e.g. "10%", "20%", "30%", "40%") and clear trigger condition descriptions.
+      For the 4 entry batches, please provide exact allocations (e.g. "10%", "20%", "30%", "40%") and clear trigger condition descriptions in Traditional Chinese.
 
       ALSO, generate an 'extraPlan' for each strategy mapping to these rules:
       - If direction is 'Buy', the extra plan should be based on buying when the price FALLS (price pullbacks or inverse logic).
       - If direction is 'Short', the extra plan should be based on shorting when the price RISES (price rallies or inverse logic).
-      The extra plan portions MUST follow the same logic as the main plan, but triggered on reverse conditions. Or formulate it to specifically match the percentages below.
+      The extra plan portions MUST follow the same logic as the main plan, but triggered on reverse conditions in Traditional Chinese. Or formulate it to specifically match the percentages below.
       The percentages for the main and extra plan MUST be exactly:
       - pyramid (正金字塔): 1st 40%, 2nd 30%, 3rd 20%, 4th 10%
       - inverted (倒金字塔): 1st 10%, 2nd 20%, 3rd 30%, 4th 40%
       - hybrid (折中方案): 1st 20%, 2nd 25%, 3rd 25%, 4th 30%
 
-      Keep the enum values (Bullish, Bearish, Neutral) in English for code compatibility.
+      Keep the direction value (Buy, Short, Wait) in English.
 
-      Return the response strictly as a JSON object with the following structure:
-      {
-        "symbol": "${targetStock.symbol}",
-        "tradingStrategy": {
-          "direction": "Buy",
-          "overview": "分四批進場的交易策略，整體思路與原因 (繁體中文)...",
-          "pyramid": {
-            "entries": [
-              { "percentage": "40%", "triggerCondition": "突破第一支撐位", "actionDetails": "建立基礎倉位..." },
-              { "percentage": "30%", "triggerCondition": "...", "actionDetails": "..." },
-              { "percentage": "20%", "triggerCondition": "...", "actionDetails": "..." },
-              { "percentage": "10%", "triggerCondition": "...", "actionDetails": "..." }
-            ],
-            "extraPlanOverview": "逆勢佈局或備用回檔加碼方案說明...",
-            "extraPlanEntries": [
-               { "percentage": "40%", "triggerCondition": "回落至/反彈至...", "actionDetails": "..." },
-               { "percentage": "30%", "triggerCondition": "...", "actionDetails": "..." },
-               { "percentage": "20%", "triggerCondition": "...", "actionDetails": "..." },
-               { "percentage": "10%", "triggerCondition": "...", "actionDetails": "..." }
-            ]
-          },
-          "inverted": {
-            "entries": [
-              { "percentage": "10%", "triggerCondition": "價格回落測試", "actionDetails": "試探性建倉..." },
-              { "percentage": "20%", "triggerCondition": "...", "actionDetails": "..." },
-              { "percentage": "30%", "triggerCondition": "...", "actionDetails": "..." },
-              { "percentage": "40%", "triggerCondition": "...", "actionDetails": "主力進場..." }
-            ],
-            "extraPlanOverview": "...",
-            "extraPlanEntries": [
-              { "percentage": "10%", "triggerCondition": "...", "actionDetails": "..." },
-              { "percentage": "20%", "triggerCondition": "...", "actionDetails": "..." },
-              { "percentage": "30%", "triggerCondition": "...", "actionDetails": "..." },
-              { "percentage": "40%", "triggerCondition": "...", "actionDetails": "..." }
-            ]
-          },
-          "hybrid": {
-            "entries": [
-              { "percentage": "20%", "triggerCondition": "...", "actionDetails": "..." },
-              { "percentage": "25%", "triggerCondition": "...", "actionDetails": "..." },
-              { "percentage": "25%", "triggerCondition": "...", "actionDetails": "..." },
-              { "percentage": "30%", "triggerCondition": "...", "actionDetails": "..." }
-            ],
-            "extraPlanOverview": "...",
-            "extraPlanEntries": [
-              { "percentage": "20%", "triggerCondition": "...", "actionDetails": "..." },
-              { "percentage": "25%", "triggerCondition": "...", "actionDetails": "..." },
-              { "percentage": "25%", "triggerCondition": "...", "actionDetails": "..." },
-              { "percentage": "30%", "triggerCondition": "...", "actionDetails": "..." }
-            ]
-          }
-        },
-        "backtest": {
-          "winRate": "65%",
-          "profitFactor": "1.8",
-          "maxDrawdown": "-12%",
-          "analysisPeriod": "過去 12 個月",
-          "improvements": ["收緊止損...", "避免在...時交易"]
-        },
-        "generatedAt": ${Date.now()}
-      }
-      
-      Do not include markdown formatting. Just return the JSON string.`;
+      Return the response strictly as a JSON object matching the requested schema.`;
 
       const response = await ai.models.generateContent({
         model: "gemini-3.5-flash",
         contents: prompt,
         config: {
           responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              symbol: { type: Type.STRING },
+              tradingStrategy: {
+                type: Type.OBJECT,
+                properties: {
+                  direction: { type: Type.STRING, description: "Must be exactly 'Buy', 'Short' or 'Wait'" },
+                  overview: { type: Type.STRING, description: "Overview of the entry logic in Traditional Chinese" },
+                  pyramid: {
+                    type: Type.OBJECT,
+                    properties: {
+                      entries: {
+                        type: Type.ARRAY,
+                        items: {
+                          type: Type.OBJECT,
+                          properties: {
+                            percentage: { type: Type.STRING },
+                            triggerCondition: { type: Type.STRING, description: "In Traditional Chinese" },
+                            actionDetails: { type: Type.STRING, description: "In Traditional Chinese" }
+                          },
+                          required: ["percentage", "triggerCondition", "actionDetails"]
+                        }
+                      },
+                      extraPlanOverview: { type: Type.STRING, description: "In Traditional Chinese" },
+                      extraPlanEntries: {
+                        type: Type.ARRAY,
+                        items: {
+                          type: Type.OBJECT,
+                          properties: {
+                            percentage: { type: Type.STRING },
+                            triggerCondition: { type: Type.STRING, description: "In Traditional Chinese" },
+                            actionDetails: { type: Type.STRING, description: "In Traditional Chinese" }
+                          },
+                          required: ["percentage", "triggerCondition", "actionDetails"]
+                        }
+                      }
+                    },
+                    required: ["entries", "extraPlanOverview", "extraPlanEntries"]
+                  },
+                  inverted: {
+                    type: Type.OBJECT,
+                    properties: {
+                      entries: {
+                        type: Type.ARRAY,
+                        items: {
+                          type: Type.OBJECT,
+                          properties: {
+                            percentage: { type: Type.STRING },
+                            triggerCondition: { type: Type.STRING, description: "In Traditional Chinese" },
+                            actionDetails: { type: Type.STRING, description: "In Traditional Chinese" }
+                          },
+                          required: ["percentage", "triggerCondition", "actionDetails"]
+                        }
+                      },
+                      extraPlanOverview: { type: Type.STRING, description: "In Traditional Chinese" },
+                      extraPlanEntries: {
+                        type: Type.ARRAY,
+                        items: {
+                          type: Type.OBJECT,
+                          properties: {
+                            percentage: { type: Type.STRING },
+                            triggerCondition: { type: Type.STRING, description: "In Traditional Chinese" },
+                            actionDetails: { type: Type.STRING, description: "In Traditional Chinese" }
+                          },
+                          required: ["percentage", "triggerCondition", "actionDetails"]
+                        }
+                      }
+                    },
+                    required: ["entries", "extraPlanOverview", "extraPlanEntries"]
+                  },
+                  hybrid: {
+                    type: Type.OBJECT,
+                    properties: {
+                      entries: {
+                        type: Type.ARRAY,
+                        items: {
+                          type: Type.OBJECT,
+                          properties: {
+                            percentage: { type: Type.STRING },
+                            triggerCondition: { type: Type.STRING, description: "In Traditional Chinese" },
+                            actionDetails: { type: Type.STRING, description: "In Traditional Chinese" }
+                          },
+                          required: ["percentage", "triggerCondition", "actionDetails"]
+                        }
+                      },
+                      extraPlanOverview: { type: Type.STRING, description: "In Traditional Chinese" },
+                      extraPlanEntries: {
+                        type: Type.ARRAY,
+                        items: {
+                          type: Type.OBJECT,
+                          properties: {
+                            percentage: { type: Type.STRING },
+                            triggerCondition: { type: Type.STRING, description: "In Traditional Chinese" },
+                            actionDetails: { type: Type.STRING, description: "In Traditional Chinese" }
+                          },
+                          required: ["percentage", "triggerCondition", "actionDetails"]
+                        }
+                      }
+                    },
+                    required: ["entries", "extraPlanOverview", "extraPlanEntries"]
+                  }
+                },
+                required: ["direction", "overview", "pyramid", "inverted", "hybrid"]
+              },
+              backtest: {
+                type: Type.OBJECT,
+                properties: {
+                  winRate: { type: Type.STRING },
+                  profitFactor: { type: Type.STRING },
+                  maxDrawdown: { type: Type.STRING },
+                  analysisPeriod: { type: Type.STRING },
+                  improvements: {
+                    type: Type.ARRAY,
+                    items: { type: Type.STRING, description: "Improvements in Traditional Chinese" }
+                  }
+                },
+                required: ["winRate", "profitFactor", "maxDrawdown", "analysisPeriod", "improvements"]
+              },
+              generatedAt: { type: Type.INTEGER }
+            },
+            required: ["symbol", "tradingStrategy", "backtest", "generatedAt"]
+          },
           tools: [{ googleSearch: {} }],
         },
       });
@@ -4757,6 +7489,147 @@ const App = () => {
       console.error(e);
     } finally {
       setNewsLoading(false);
+    }
+  };
+
+  const fetchFinancialHealth = async () => {
+    if (!stockData?.symbol || !report) return;
+    setFinancialHealthLoading(true);
+    try {
+      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+      const prompt = `${getCurrentDateContext()} Focus on target stock: "${stockData.symbol}" (${stockData.name}). Use Google Search to retrieve the company's financial data for the past 5 years.
+      Decompose and analyze the following 6 metrics:
+      - 收入增長 (Revenue growth)
+      - 淨利潤趨勢 (Net profit trends)
+      - 自由現金流 (Free cash flow)
+      - 利潤率 (Profit margins)
+      - 債務水平 (Debt levels)
+      - 股本回報率 (Return on equity)
+      
+      Compare these 5-year trends with the latest quarterly financial data of the newest quarter. Explain in detail whether the company's financial state is "衰退" (declining/weakening) or "強勁" (strong/growing).
+      
+      CRITICAL: All descriptive text MUST be in Traditional Chinese (繁體中文).
+      
+      Return the response strictly as a JSON object with this exact structure:
+      {
+        "financialHealth": {
+          "status": "衰退" | "強勁",
+          "overview": "總體財務狀況健康度詳細解讀，說明與最新季度財報對比的結果 (繁體中文)...",
+          "metrics": {
+            "revenueGrowth": "過去5年收入增長分析與最新季度財報詳細比照 (繁體中文)...",
+            "netProfitTrend": "過去5年淨利潤趨勢分析與最新季度財報詳細比照 (繁體中文)...",
+            "freeCashFlow": "過去5年自由現金流分析與最新季度財報詳細比照 (繁體中文)...",
+            "profitMargins": "過去5年利潤率分析與最新季度財報詳細比照 (繁體中文)...",
+            "debtLevels": "過去5年債務水平分析與最新季度財報詳細比照 (繁體中文)...",
+            "returnOnEquity": "過去5年股本回報率分析與最新季度財報詳細比照 (繁體中文)..."
+          }
+        }
+      }
+      Do not include markdown formatting. Just return the JSON string.`;
+
+      const response = await ai.models.generateContent({
+        model: "gemini-3.5-flash",
+        contents: prompt,
+        config: {
+          responseMimeType: "application/json",
+          tools: [{ googleSearch: {} }],
+        },
+      });
+
+      const data = safeParseJson(response.text || "{}");
+      if (data.financialHealth) {
+        setReports((prev) => ({
+          ...prev,
+          [stockData.symbol]: {
+            ...prev[stockData.symbol],
+            financialHealth: data.financialHealth
+          }
+        }));
+      }
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setFinancialHealthLoading(false);
+    }
+  };
+
+  const fetchRiskAnalysis = async () => {
+    if (!stockData?.symbol || !report) return;
+    setRiskAnalysisLoading(true);
+    try {
+      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+      const prompt = `${getCurrentDateContext()} Focus on target stock: "${stockData.symbol}" (${stockData.name}). Use Google Search to identify the biggest risks of investing in this stock.
+      Analyze the following 6 core risks:
+      - 經濟風險 (Economic risks)
+      - 行業顛覆 (Industry disruption)
+      - 競爭 (Competition)
+      - 監管威脅 (Regulatory threats)
+      - 債務或財務風險 (Debt or financial risks)
+      - 公司政策導向與挑戰 (Company policy direction and challenges)
+      
+      You must satisfy these exact rules:
+      1. Sort these 6 risks strictly based on their level of threat/danger regarding the stock price and business survival from highest danger level to lowest danger level (按照對股價和企業生存的「危險程度由高到低」進行嚴格的優先權排序).
+      2. For each risk, assign a severity level of "低" (Low), "中" (Medium), or "高" (High).
+      3. Assign an overall Risk Rating ("riskLevel") for the stock choosing strictly from: "低" (Low), "觀察" (Watch), or "高" (High).
+      4. Create a debate forum ("debate") between two top industry analysts:
+         - One analyst is bullish (看漲)
+         - One analyst is bearish (看跌)
+         - Both analysts must perform their duties carefully (各司其職), offering plenty of concrete numbers, financial figures, and industry statistics/data (提供充足的數據和行業統計).
+         - Conclude the debate with a definitive concluding statement ("conclusion"), summarizing both perspectives but strictly choosing and leaning towards EITHER a bullish (看漲) OR a bearish (看跌) conclusion explicitly as the final outcome (最後並得出看漲或看跌的其中之一的結論).
+         
+      CRITICAL: All descriptive text inside risks and debates MUST be in Traditional Chinese (繁體中文).
+      
+      Return the response strictly as a JSON object with this exact structure:
+      {
+        "riskAnalysis": {
+          "riskLevel": "低" | "觀察" | "高",
+          "risks": [
+            {
+              "category": "經濟風險" | "行業顛覆" | "競爭" | "監管威脅" | "債務或財務風險" | "公司政策導向與挑戰",
+              "severity": "低" | "中" | "高",
+              "description": "具體風險說明與威脅來源對比分析 (繁體中文)..."
+            }
+          ],
+          "debate": {
+            "bullishAnalystName": "看漲分析師的名字 (繁體中文)...",
+            "bullishArguments": [
+              "有具體數據與理據支持的看漲理論與觀點 1 (繁體中文)...",
+              "有具體數據與理據支持的看漲理論與觀點 2 (繁體中文)..."
+            ],
+            "bearishAnalystName": "看跌分析師的名字 (繁體中文)...",
+            "bearishArguments": [
+              "有具體數據與理據支持的看跌理論與觀點 1 (繁體中文)...",
+              "有具體數據與理據支持的看跌理論與觀點 2 (繁體中文)..."
+            ],
+            "conclusion": "對於多空觀點與數據進行全面考量後，明確得出看漲 (Bullish) 或看跌 (Bearish) 其中之一的結論與核心理由 (繁體中文)..."
+          }
+        }
+      }
+      Do not include markdown formatting. Just return the JSON string.`;
+
+      const response = await ai.models.generateContent({
+        model: "gemini-3.5-flash",
+        contents: prompt,
+        config: {
+          responseMimeType: "application/json",
+          tools: [{ googleSearch: {} }],
+        },
+      });
+
+      const data = safeParseJson(response.text || "{}");
+      if (data.riskAnalysis) {
+        setReports((prev) => ({
+          ...prev,
+          [stockData.symbol]: {
+            ...prev[stockData.symbol],
+            riskAnalysis: data.riskAnalysis
+          }
+        }));
+      }
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setRiskAnalysisLoading(false);
     }
   };
 
@@ -4852,36 +7725,428 @@ const App = () => {
     const n = nam || stockData?.name || s;
     const sh = sha ?? 1;
     if (!s) return;
+    const newTrade: Trade = {
+      id: Math.random().toString(36).substr(2, 9),
+      symbol: s,
+      name: n,
+      type,
+      price: p,
+      shares: sh,
+      date: new Date().toLocaleDateString(),
+      timestamp: Date.now(),
+    };
     setTrades((prev) => [
       ...prev,
-      {
-        id: Math.random().toString(36).substr(2, 9),
-        symbol: s,
-        name: n,
-        type,
-        price: p,
-        shares: sh,
-        date: new Date().toLocaleDateString(),
-        timestamp: Date.now(),
-      },
+      newTrade,
     ]);
+    if (gdUser) {
+      saveTradeToFirestore(gdUser.uid, newTrade);
+    }
   };
 
   const handleWatchlist = () => {
     if (!stockData) return;
-    if (watchlist.some((i) => i.symbol === stockData.symbol))
+    const isExist = watchlist.some((i) => i.symbol === stockData.symbol);
+    const scoresAndTime = {
+      timestamp: Date.now(),
+      price: Number(stockData.price),
+      changePercent: Number(stockData.changePercent),
+      buyScore: stockData.buyScore,
+      sellScore: stockData.sellScore,
+      qualityScore: stockData.qualityScore,
+      valueScore: stockData.valueScore,
+      crashSimilarityScore: stockData.crashSimilarityScore,
+      posScore: getPosScore(stockData),
+      negScore: getNegScore(stockData),
+      aiScore: stockData.screenerRating?.score,
+      action: stockData.screenerRating?.action || "Neutral",
+    };
+
+    if (isExist) {
       setWatchlist((prev) => prev.filter((i) => i.symbol !== stockData.symbol));
-    else
+      if (gdUser) {
+        deleteWatchlistItemFromFirestore(gdUser.uid, stockData.symbol);
+      }
+    } else {
+      const newItem: WatchlistItem = {
+        symbol: stockData.symbol,
+        name: stockData.name,
+        price: Number(stockData.price),
+        changePercent: Number(stockData.changePercent),
+        timestamp: Date.now(),
+        buyScore: stockData.buyScore,
+        sellScore: stockData.sellScore,
+        qualityScore: stockData.qualityScore,
+        valueScore: stockData.valueScore,
+        crashSimilarityScore: stockData.crashSimilarityScore,
+        posScore: getPosScore(stockData),
+        negScore: getNegScore(stockData),
+        aiScore: stockData.screenerRating?.score,
+        action: stockData.screenerRating?.action || "Neutral",
+        history: [scoresAndTime],
+      };
       setWatchlist((prev) => [
         ...prev,
-        {
-          symbol: stockData.symbol,
-          name: stockData.name,
+        newItem,
+      ]);
+      if (gdUser) {
+        saveWatchlistItemToFirestore(gdUser.uid, newItem);
+      }
+    }
+  };
+
+  const handleAddOrUpdateWatchlist = () => {
+    if (!stockData) return;
+    const existingIndex = watchlist.findIndex((i) => i.symbol === stockData.symbol);
+    const scoresAndTime = {
+      timestamp: Date.now(),
+      price: Number(stockData.price),
+      changePercent: Number(stockData.changePercent),
+      buyScore: stockData.buyScore,
+      sellScore: stockData.sellScore,
+      qualityScore: stockData.qualityScore,
+      valueScore: stockData.valueScore,
+      crashSimilarityScore: stockData.crashSimilarityScore,
+      posScore: getPosScore(stockData),
+      negScore: getNegScore(stockData),
+      aiScore: stockData.screenerRating?.score,
+      action: stockData.screenerRating?.action || "Neutral",
+    };
+
+    if (existingIndex > -1) {
+      setWatchlist((prev) => {
+        const updated = [...prev];
+        const currentItem = updated[existingIndex];
+        const newHistory = Array.isArray(currentItem.history) && currentItem.history.length > 0
+          ? [...currentItem.history]
+          : [{
+              timestamp: currentItem.timestamp || Date.now() - 1, // Ensure old record comes before if exact
+              price: currentItem.price || 0,
+              changePercent: currentItem.changePercent || 0,
+              buyScore: currentItem.buyScore,
+              sellScore: currentItem.sellScore,
+              qualityScore: currentItem.qualityScore,
+              valueScore: currentItem.valueScore,
+              crashSimilarityScore: currentItem.crashSimilarityScore,
+              posScore: currentItem.posScore,
+              negScore: currentItem.negScore,
+              aiScore: currentItem.aiScore,
+              action: currentItem.action || "Neutral",
+            }];
+        newHistory.push(scoresAndTime);
+        
+        updated[existingIndex] = {
+          ...currentItem,
           price: Number(stockData.price),
           changePercent: Number(stockData.changePercent),
           timestamp: Date.now(),
-        },
-      ]);
+          buyScore: stockData.buyScore,
+          sellScore: stockData.sellScore,
+          qualityScore: stockData.qualityScore,
+          valueScore: stockData.valueScore,
+          crashSimilarityScore: stockData.crashSimilarityScore,
+          posScore: getPosScore(stockData),
+          negScore: getNegScore(stockData),
+          aiScore: stockData.screenerRating?.score,
+          action: stockData.screenerRating?.action || "Neutral",
+          history: newHistory,
+        };
+        
+        if (gdUser) {
+          saveWatchlistItemToFirestore(gdUser.uid, updated[existingIndex]);
+        }
+
+        // Also sync updated scores to the screener watchlist if it exists there
+        setSelectedScreenerItems((prevScreener) => {
+          const sIdx = prevScreener.findIndex(i => i.symbol === stockData.symbol);
+          if (sIdx > -1) {
+            const newerS = [...prevScreener];
+            newerS[sIdx] = {
+              ...newerS[sIdx],
+              price: Number(stockData.price),
+              changePercent: Number(stockData.changePercent),
+              aiScore: stockData.screenerRating?.score,
+              buyScore: stockData.buyScore,
+              sellScore: stockData.sellScore,
+              qualityScore: stockData.qualityScore,
+              valueScore: stockData.valueScore,
+              crashSimilarityScore: stockData.crashSimilarityScore,
+            };
+            return newerS;
+          }
+          return prevScreener;
+        });
+
+        return updated;
+      });
+      alert(`已更新 ${stockData.symbol} 觀察名單評分！`);
+    } else {
+      const newItem: WatchlistItem = {
+        symbol: stockData.symbol,
+        name: stockData.name,
+        price: Number(stockData.price),
+        changePercent: Number(stockData.changePercent),
+        timestamp: Date.now(),
+        buyScore: stockData.buyScore,
+        sellScore: stockData.sellScore,
+        qualityScore: stockData.qualityScore,
+        valueScore: stockData.valueScore,
+        crashSimilarityScore: stockData.crashSimilarityScore,
+        posScore: getPosScore(stockData),
+        negScore: getNegScore(stockData),
+        aiScore: stockData.screenerRating?.score,
+        action: stockData.screenerRating?.action || "Neutral",
+        history: [scoresAndTime],
+      };
+      setWatchlist((prev) => [...prev, newItem]);
+      if (gdUser) {
+        saveWatchlistItemToFirestore(gdUser.uid, newItem);
+      }
+      alert(`已將 ${stockData.symbol} 加入觀察名單！`);
+    }
+  };
+
+  const handleUpdateAllWatchlistRatings = async () => {
+    if (watchlist.length === 0) return;
+    setUpdatingWatchlist(true);
+    setWatchlistUpdateProgress("準備更新所有個股評分...");
+    
+    try {
+      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+      const updatedWatchlist = [...watchlist];
+
+      for (let i = 0; i < updatedWatchlist.length; i++) {
+        const item = updatedWatchlist[i];
+        setWatchlistUpdateProgress(`正在更新 ${item.symbol} 評分 (${i + 1}/${updatedWatchlist.length})...`);
+
+        const prompt = `You are Martin Armstrong's Socrates AI. Perform a quick rating update for "${item.symbol}".
+        ${getCurrentDateContext()}
+        Step 1: Use Google Search to find the latest real-time stock price and change percentage from Yahoo Finance.
+        Step 2: Re-calculate/estimate the Socrates rating metrics carefully:
+          - buyScore (1-10)
+          - sellScore (1-10)
+          - qualityScore (1-10)
+          - valueScore (1-10)
+          - crashSimilarityScore (1-10)
+          - compositeRating/Score (1-10)
+          - activeAction ("Buy" | "Sell" | "Neutral")
+          
+        Output in Traditional Chinese.
+        Return ONLY a JSON formatted string according to the following schema:
+        {
+          "symbol": "${item.symbol}",
+          "name": "${item.name}",
+          "price": 0.00,
+          "changePercent": 0.00,
+          "buyScore": 8,
+          "sellScore": 2,
+          "screenerRating": {"score": 8, "action": "Buy"},
+          "qualityScore": 8,
+          "valueScore": 7,
+          "crashSimilarityScore": 5
+        }`;
+
+        try {
+          const response = await ai.models.generateContent({
+            model: "gemini-3.5-flash",
+            contents: prompt,
+            config: {
+              responseMimeType: "application/json",
+              tools: [{ googleSearch: {} }],
+              temperature: 0.1,
+            },
+          });
+
+          const data = safeParseJson(response.text || "{}");
+          if (data.symbol) {
+            const p = Number(data.price) || item.price;
+            const cp = Number(data.changePercent) || item.changePercent;
+            const buyS = data.buyScore !== undefined ? Number(data.buyScore) : (item.buyScore ?? 5);
+            const sellS = data.sellScore !== undefined ? Number(data.sellScore) : (item.sellScore ?? 5);
+            const qualS = data.qualityScore !== undefined ? Number(data.qualityScore) : (item.qualityScore ?? 5);
+            const valS = data.valueScore !== undefined ? Number(data.valueScore) : (item.valueScore ?? 5);
+            const crashS = data.crashSimilarityScore !== undefined ? Number(data.crashSimilarityScore) : (item.crashSimilarityScore ?? 5);
+            const aiS = data.screenerRating?.score !== undefined ? Number(data.screenerRating.score) : (item.aiScore ?? 5);
+            const activeAction = data.screenerRating?.action || item.action || "Neutral";
+            
+            const posS = Math.max(1, Math.min(10, Math.floor((buyS + qualS + valS) / 3)));
+            const negS = Math.max(1, Math.min(10, Math.floor((sellS + crashS) / 2)));
+            
+            const scoresAndTime = {
+              timestamp: Date.now(),
+              price: p,
+              changePercent: cp,
+              buyScore: buyS,
+              sellScore: sellS,
+              qualityScore: qualS,
+              valueScore: valS,
+              crashSimilarityScore: crashS,
+              posScore: posS,
+              negScore: negS,
+              aiScore: aiS,
+              action: activeAction,
+            };
+
+            const curHistory = Array.isArray(item.history) && item.history.length > 0
+              ? [...item.history]
+              : [{
+                  timestamp: item.timestamp || Date.now() - 1,
+                  price: item.price || 0,
+                  changePercent: item.changePercent || 0,
+                  buyScore: item.buyScore,
+                  sellScore: item.sellScore,
+                  qualityScore: item.qualityScore,
+                  valueScore: item.valueScore,
+                  crashSimilarityScore: item.crashSimilarityScore,
+                  posScore: item.posScore,
+                  negScore: item.negScore,
+                  aiScore: item.aiScore,
+                  action: item.action || "Neutral",
+                }];
+            curHistory.push(scoresAndTime);
+
+            updatedWatchlist[i] = {
+              ...item,
+              price: p,
+              changePercent: cp,
+              timestamp: Date.now(),
+              buyScore: buyS,
+              sellScore: sellS,
+              qualityScore: qualS,
+              valueScore: valS,
+              crashSimilarityScore: crashS,
+              posScore: posS,
+              negScore: negS,
+              aiScore: aiS,
+              action: activeAction,
+              history: curHistory,
+            };
+
+            if (gdUser) {
+              saveWatchlistItemToFirestore(gdUser.uid, updatedWatchlist[i]);
+            }
+
+            setSelectedScreenerItems((prevScreener) => {
+              const sIdx = prevScreener.findIndex(si => si.symbol === item.symbol);
+              if (sIdx > -1) {
+                const newerS = [...prevScreener];
+                newerS[sIdx] = {
+                  ...newerS[sIdx],
+                  price: p,
+                  changePercent: cp,
+                  aiScore: aiS,
+                  buyScore: buyS,
+                  sellScore: sellS,
+                  qualityScore: qualS,
+                  valueScore: valS,
+                  crashSimilarityScore: crashS,
+                };
+                return newerS;
+              }
+              return prevScreener;
+            });
+          }
+        } catch (innerErr) {
+          console.error(`Failed to update rating for ${item.symbol}:`, innerErr);
+        }
+      }
+
+      setWatchlist(updatedWatchlist);
+      localStorage.setItem("ecm_watchlist", JSON.stringify(updatedWatchlist));
+      setWatchlistUpdateProgress("🎉 所有觀察名單評分更新完成！");
+      setTimeout(() => setWatchlistUpdateProgress(""), 4000);
+    } catch (err: any) {
+      console.error(err);
+      alert(getQuotaErrorMessage(err.message || err.toString() || "更新觀察名單發生異常，請稍後重試。"));
+    } finally {
+      setUpdatingWatchlist(false);
+    }
+  };
+
+  const handleDeleteWatchHistory = async (symbol: string, timestampToDelete: number) => {
+    try {
+      setWatchlist((prev) => {
+        return prev.map((item) => {
+          if (item.symbol !== symbol) return item;
+
+          const historyList = Array.isArray(item.history) && item.history.length > 0
+            ? item.history
+            : [{
+                timestamp: item.timestamp,
+                price: item.price,
+                changePercent: item.changePercent,
+                buyScore: item.buyScore,
+                sellScore: item.sellScore,
+                qualityScore: item.qualityScore,
+                valueScore: item.valueScore,
+                crashSimilarityScore: item.crashSimilarityScore,
+                posScore: item.posScore,
+                negScore: item.negScore,
+                aiScore: item.aiScore,
+                action: item.action,
+              }];
+
+          const filteredHistory = historyList.filter((h) => h.timestamp !== timestampToDelete);
+          const sortedRemaining = [...filteredHistory].sort((a, b) => b.timestamp - a.timestamp);
+
+          let updated: WatchlistItem;
+          if (sortedRemaining.length > 0) {
+            const latest = sortedRemaining[0];
+            updated = {
+              ...item,
+              price: latest.price ?? item.price,
+              changePercent: latest.changePercent ?? item.changePercent,
+              timestamp: latest.timestamp,
+              buyScore: latest.buyScore,
+              sellScore: latest.sellScore,
+              qualityScore: latest.qualityScore,
+              valueScore: latest.valueScore,
+              crashSimilarityScore: latest.crashSimilarityScore,
+              posScore: latest.posScore,
+              negScore: latest.negScore,
+              aiScore: latest.aiScore,
+              action: latest.action,
+              history: filteredHistory,
+            };
+          } else {
+            updated = {
+              symbol: item.symbol,
+              name: item.name,
+              price: item.price,
+              changePercent: item.changePercent,
+              timestamp: Date.now(),
+              history: [],
+            };
+          }
+          if (gdUser) {
+            saveWatchlistItemToFirestore(gdUser.uid, updated);
+          }
+          return updated;
+        });
+      });
+    } catch (err) {
+      console.error("Failed to delete watch history record:", err);
+    }
+  };
+
+  const handleClearWatchHistory = async (symbol: string) => {
+    try {
+      setWatchlist((prev) => {
+        return prev.map((item) => {
+          if (item.symbol !== symbol) return item;
+          const updated = {
+            ...item,
+            history: [],
+          };
+          if (gdUser) {
+            saveWatchlistItemToFirestore(gdUser.uid, updated);
+          }
+          return updated;
+        });
+      });
+    } catch (err) {
+      console.error("Failed to clear watch history:", err);
+    }
   };
 
   const refreshPrices = useCallback(async () => {
@@ -4968,7 +8233,7 @@ const App = () => {
   return (
     <div className="min-h-screen bg-slate-900 text-slate-200">
       <header className="sticky top-0 z-40 bg-slate-900/80 backdrop-blur-md border-b border-slate-800 p-4">
-        <div className="max-w-6xl mx-auto flex justify-between items-center">
+        <div className="max-w-[1440px] w-full mx-auto flex justify-between items-center">
           <div className="flex items-center gap-3">
             <div className="relative">
               <Clock className="w-9 h-9 text-amber-500" />
@@ -4986,6 +8251,76 @@ const App = () => {
               <Info className="w-4 h-4 text-blue-400" />
               <span className="text-white text-sm hidden sm:inline">
                 評分說明
+              </span>
+            </button>
+            {gdUser ? (
+              <div className="flex items-center gap-2">
+                <div className="flex items-center gap-2 bg-slate-900 border border-slate-800 px-3 py-2.5 rounded-xl">
+                  {gdUser.photoURL ? (
+                    <img
+                      src={gdUser.photoURL}
+                      alt={gdUser.displayName || "User"}
+                      className="w-5 h-5 rounded-full border border-slate-700"
+                      referrerPolicy="no-referrer"
+                    />
+                  ) : (
+                    <div className="w-5 h-5 rounded-full bg-slate-800 border border-slate-700 flex items-center justify-center text-[10px] text-white font-black">
+                      {gdUser.displayName ? gdUser.displayName[0] : gdUser.email ? gdUser.email[0].toUpperCase() : "U"}
+                    </div>
+                  )}
+                  <span className="text-slate-300 text-xs font-bold hidden xl:inline max-w-[80px] truncate">
+                    {gdUser.displayName || gdUser.email?.split("@")[0]}
+                  </span>
+                  <button
+                    id="google-signout-btn"
+                    onClick={handleGoogleDriveLogout}
+                    className="bg-rose-500/10 hover:bg-rose-500/25 text-rose-400 text-xs px-2 py-0.5 rounded border border-rose-500/20 transition-all ml-1 font-bold"
+                  >
+                    登出
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <button
+                id="google-signin-btn"
+                onClick={handleGoogleDriveLogin}
+                disabled={isLoggingIn}
+                className={`flex items-center gap-2 bg-slate-800 hover:bg-slate-750 px-4 py-2.5 rounded-xl font-bold border border-slate-700 hover:border-amber-500/30 transition-all text-slate-200 relative group ${isLoggingIn ? "opacity-50 cursor-not-allowed" : ""}`}
+              >
+                {isLoggingIn ? (
+                  <div className="w-4 h-4 border-2 border-slate-300 border-t-transparent rounded-full animate-spin" />
+                ) : (
+                  <svg className="w-4 h-4" viewBox="0 0 24 24">
+                    <path
+                      fill="#ea4335"
+                      d="M12 5.04c1.64 0 3.12.56 4.28 1.67l3.2-3.2C17.52 1.58 14.94 1 12 1 7.24 1 3.13 3.76 1.13 7.78l3.78 2.93c.92-2.76 3.51-4.67 7.09-4.67z"
+                    />
+                    <path
+                      fill="#4285f4"
+                      d="M23.49 12.27c0-.81-.07-1.59-.2-2.33H12v4.51h6.44c-.29 1.5-.1.81-1.14 2l3.7 2.87c2.16-1.99 3.49-4.92 3.49-7.05z"
+                    />
+                    <path
+                      fill="#fbbc05"
+                      d="M4.91 14.85l-3.78 2.93c2 4.02 6.11 6.78 10.87 6.78 2.94 0 5.61-.96 7.49-2.61l-3.7-2.87c-.98.66-2.23 1.06-3.79 1.06-3.58 0-6.17-1.91-7.09-4.67L4.91 14.85z"
+                    />
+                    <path
+                      fill="#34a853"
+                      d="M12 23.56c4.76 0 8.87-2.76 10.87-6.78l-3.7-2.87c-.92 2.76-3.51 4.67-7.09 4.67-1.64 0-3.12-.56-4.28-1.67l-3.2 3.2c1.96 1.93 4.54 3.45 7.49 3.45z"
+                    />
+                  </svg>
+                )}
+                <span className="text-white text-sm hidden sm:inline">
+                  {isLoggingIn ? "登入中..." : "Google 帳號登入"}
+                </span>
+              </button>
+            )}
+            <button
+              onClick={() => setShowPortfolio(true)}
+              className="flex items-center gap-2 bg-slate-800 hover:bg-slate-750 px-4 py-2.5 rounded-xl font-bold border border-slate-700 hover:border-amber-500/50 transition-all text-amber-500 relative group shadow-lg"
+            >
+              <Eye className="w-4 h-4 text-amber-500" />
+              <span className="text-white text-sm hidden sm:inline">
+                觀察名單、投資組合
               </span>
             </button>
             <label className="flex items-center gap-2 bg-slate-800 hover:bg-slate-700 px-4 py-2.5 rounded-xl font-bold border border-slate-700 transition-colors cursor-pointer relative group">
@@ -5027,10 +8362,10 @@ const App = () => {
         </div>
       </header>
 
-      <main className="max-w-6xl mx-auto p-4 md:p-8 space-y-8">
-        <div className="flex flex-col md:flex-row gap-4 max-w-4xl mx-auto">
+      <main className="max-w-[1440px] w-full mx-auto p-4 md:p-8 space-y-8">
+        <div className="max-w-2xl mx-auto">
           {/* Main Search */}
-          <div className="relative group flex-1">
+          <div className="relative group">
             <Search className="absolute left-6 top-1/2 -translate-y-1/2 text-slate-500 group-hover:text-amber-500 transition-colors z-10" />
             <input
               type="text"
@@ -5055,35 +8390,6 @@ const App = () => {
               完整週期分析
             </div>
           </div>
-
-          {/* Quick Search */}
-          <div className="relative group flex-1">
-            <Zap className="absolute left-6 top-1/2 -translate-y-1/2 text-slate-500 group-hover:text-amber-500 transition-colors z-10" />
-            <input
-              type="text"
-              value={quickInputSymbol}
-              onChange={(e) =>
-                setQuickInputSymbol(e.target.value.toUpperCase())
-              }
-              onKeyDown={(e) => e.key === "Enter" && fetchQuickAnalysis()}
-              placeholder="快速模式 (META,CRM...)"
-              className="w-full bg-slate-950 border-2 border-slate-700/50 pl-14 pr-16 py-4 rounded-3xl focus:outline-none focus:ring-4 focus:ring-amber-500/10 focus:border-amber-500/50 hover:border-emerald-500/50 hover:shadow-[0_0_30px_rgba(16,185,129,0.1)] text-lg font-mono transition-all placeholder:text-slate-600"
-            />
-            <button
-              onClick={fetchQuickAnalysis}
-              disabled={quickLoading}
-              className="absolute right-2 top-2 bg-slate-800 hover:bg-slate-700 text-amber-500 p-3 rounded-2xl transition-all shadow-lg active:scale-95 border border-slate-700"
-            >
-              {quickLoading ? (
-                <Loader2 className="w-5 h-5 animate-spin" />
-              ) : (
-                <Zap className="w-5 h-5" />
-              )}
-            </button>
-            <div className="absolute -top-3 left-6 bg-[#0f172a] px-2 text-[10px] font-bold text-slate-500 uppercase tracking-widest hidden md:block">
-              快速評分模式 (支援多個標的)
-            </div>
-          </div>
         </div>
 
         {quickLoading && (
@@ -5101,7 +8407,9 @@ const App = () => {
         {quickResults.length > 0 && (
           <div className="space-y-4 max-w-4xl mx-auto animate-in fade-in slide-in-from-bottom-4">
             {quickResults.map((res, idx) => (
-              <QuickStockHeader key={idx} stockData={res} />
+              <div key={idx}>
+                <QuickStockHeader stockData={res} />
+              </div>
             ))}
           </div>
         )}
@@ -5377,18 +8685,18 @@ const App = () => {
                 </div>
               </div>
 
-              <div className="flex items-center justify-between border-t border-slate-700/50 mt-4 pt-3 w-full">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-t border-slate-700/50 mt-4 pt-3 w-full">
                 <div className="flex items-center gap-2">
                   <p className="text-slate-400 font-bold uppercase text-xs tracking-widest leading-none">
                     {stockData.name}
                   </p>
                   <button
                     onClick={handleWatchlist}
-                    className={`p-1 rounded-full transition-all ${watchlist.some((i) => i.symbol === stockData.symbol) ? "text-amber-500" : "text-slate-600 hover:text-slate-400"}`}
+                    className={`p-1.5 rounded-full transition-all ${watchlist.some((i) => i.symbol === stockData.symbol) ? "text-amber-500 bg-amber-500/10" : "text-slate-600 hover:text-slate-400"}`}
                     title={
                       watchlist.some((i) => i.symbol === stockData.symbol)
-                        ? "取消追蹤"
-                        : "追蹤"
+                        ? "移除觀察"
+                        : "納入觀察"
                     }
                   >
                     <Star
@@ -5396,10 +8704,20 @@ const App = () => {
                     />
                   </button>
                 </div>
+
+                <button
+                  type="button"
+                  onClick={handleAddOrUpdateWatchlist}
+                  className="flex items-center gap-2 bg-gradient-to-r from-amber-600/95 to-amber-500/95 hover:from-amber-600 hover:to-amber-500 text-white font-extrabold text-xs px-4.5 py-2 rounded-xl transition-all shadow-[0_4px_12px_rgba(217,119,6,0.15)] hover:shadow-[0_4px_16px_rgba(217,119,6,0.25)] shrink-0 self-start sm:self-auto"
+                >
+                  <Eye className="w-3.5 h-3.5 text-white" />
+                  {watchlist.some((i) => i.symbol === stockData.symbol) ? "更新觀測評分" : "加入觀察名單"}
+                </button>
               </div>
             </div>
 
-            <div className="flex flex-wrap gap-2 justify-between border-b border-slate-800 pb-1">
+            {/* Desktop Navigation Tabs */}
+            <div className="hidden sm:flex flex-wrap gap-2 justify-between border-b border-slate-800 pb-1">
               <div className="flex gap-2 w-full md:w-auto overflow-x-auto custom-scrollbar pb-1">
                 <button
                   onClick={() => setViewTab("report")}
@@ -5415,6 +8733,73 @@ const App = () => {
                   <Filter className="w-5 h-5 inline mr-2" />
                   篩選器
                 </button>
+                <button
+                  onClick={() => setViewTab("screenerWatchlist")}
+                  className={`flex-shrink-0 px-6 py-3 rounded-t-xl text-base font-bold ${viewTab === "screenerWatchlist" && !isExporting ? "bg-slate-800 text-amber-500 border-slate-700 border-t border-x" : "text-slate-500"}`}
+                >
+                  <List className="w-5 h-5 inline mr-2" />
+                  精選名單
+                </button>
+                <button
+                  onClick={() => setViewTab("macroFilter")}
+                  className={`flex-shrink-0 px-6 py-3 rounded-t-xl text-base font-bold ${viewTab === "macroFilter" && !isExporting ? "bg-slate-800 text-amber-500 border-slate-700 border-t border-x" : "text-slate-500"}`}
+                >
+                  <Activity className="w-5 h-5 inline mr-2" />
+                  大盤濾網
+                </button>
+                <button
+                  onClick={() => setViewTab("alphaMatrix")}
+                  className={`flex-shrink-0 px-6 py-3 rounded-t-xl text-base font-bold ${viewTab === "alphaMatrix" && !isExporting ? "bg-slate-800 text-amber-500 border-slate-700 border-t border-x" : "text-slate-500"}`}
+                >
+                  <Cpu className="w-5 h-5 inline mr-2" />
+                  個股微觀 Alpha 矩陣
+                </button>
+                <button
+                  onClick={() => setViewTab("portfolio")}
+                  className={`flex-shrink-0 px-6 py-3 rounded-t-xl text-base font-bold ${viewTab === "portfolio" && !isExporting ? "bg-slate-800 text-amber-500 border-slate-700 border-t border-x" : "text-slate-500"}`}
+                >
+                  <Briefcase className="w-5 h-5 inline mr-2" />
+                  投資組合
+                </button>
+              </div>
+            </div>
+
+            {/* Mobile Navigation Tabs */}
+            <div className="flex sm:hidden flex-col gap-2 border-b border-slate-800/50 pb-3">
+              <div className="relative w-full overflow-hidden bg-slate-950/40 p-1 rounded-xl border border-slate-800/50 shadow-inner">
+                {/* Horizontal side scroll fade indicators */}
+                <div className="pointer-events-none absolute left-0 top-0 bottom-0 w-6 bg-gradient-to-r from-slate-950 to-transparent z-10" />
+                <div className="pointer-events-none absolute right-0 top-0 bottom-0 w-6 bg-gradient-to-l from-slate-950 to-transparent z-10" />
+                
+                <div className="flex gap-1 overflow-x-auto scrollbar-hide no-scrollbar py-0.5 px-1 scroll-smooth">
+                  {[
+                    { id: "report", label: "智能報告", icon: FileText },
+                    { id: "screener", label: "篩選器", icon: Filter },
+                    { id: "screenerWatchlist", label: "精選名單", icon: List },
+                    { id: "macroFilter", label: "大盤濾網", icon: Activity },
+                    { id: "alphaMatrix", label: "Alpha 矩陣", icon: Cpu },
+                    { id: "portfolio", label: "投資組合", icon: Briefcase }
+                  ].map((tab) => {
+                    const TabIcon = tab.icon;
+                    const isActive = viewTab === tab.id && !isExporting;
+                    return (
+                      <button
+                        key={tab.id}
+                        type="button"
+                        onClick={() => setViewTab(tab.id as any)}
+                        style={{ height: '44px' }}
+                        className={`flex items-center gap-1.5 px-3.5 rounded-lg text-xs font-black tracking-tight transition-all shrink-0 cursor-pointer ${
+                          isActive
+                            ? "bg-amber-600/15 text-amber-400 border border-amber-500/30 shadow-md"
+                            : "bg-transparent text-slate-400 hover:text-slate-200 border border-transparent"
+                        }`}
+                      >
+                        <TabIcon className={`w-3.5 h-3.5 ${isActive ? "text-amber-400" : "text-slate-500"}`} />
+                        <span>{tab.label}</span>
+                      </button>
+                    );
+                  })}
+                </div>
               </div>
             </div>
 
@@ -5432,37 +8817,200 @@ const App = () => {
                     stockData={stockData}
                     onFetchNewsInsight={fetchNewsInsight}
                     newsLoading={newsLoading}
+                    onFetchFinancialHealth={fetchFinancialHealth}
+                    financialHealthLoading={financialHealthLoading}
+                    onFetchRiskAnalysis={fetchRiskAnalysis}
+                    riskAnalysisLoading={riskAnalysisLoading}
+                    gdUser={gdUser}
+                    gdToken={gdToken}
+                    onOpenWorkspaceHub={() => setShowGoogleDrive(true)}
                   />
                 </div>
               )}
-              {(viewTab === "screener" || isExporting) && (
+              {viewTab === "macroFilter" && !isExporting && (
                 <div className="animate-in fade-in duration-300">
-                  <PriceScreener />
+                  <MacroFilterView
+                    symbol={stockData?.symbol}
+                    stockName={stockData?.name}
+                  />
+                </div>
+              )}
+              {viewTab === "alphaMatrix" && !isExporting && (
+                <div className="animate-in fade-in duration-300">
+                  <AlphaMatrixView
+                    symbol={stockData.symbol}
+                    stockName={stockData.name}
+                  />
+                </div>
+              )}
+              {viewTab === "portfolio" && !isExporting && (
+                <div className="animate-in fade-in duration-300">
+                  <PortfolioView
+                    currentPrices={cachedPrices}
+                    gdUser={gdUser}
+                    gdToken={gdToken}
+                    onGoogleDriveLogin={handleGoogleDriveLogin}
+                  />
+                </div>
+              )}
+              {(viewTab === "screener" || viewTab === "screenerWatchlist" || isExporting) && (
+                <div className="animate-in fade-in duration-300">
+                  <PriceScreener
+                    isWatchlistMode={viewTab === "screenerWatchlist"}
+                    selectedScreenerItems={selectedScreenerItems}
+                    onToggleScreenerItem={toggleScreenerItem}
+                    onImportLocal={() => setShowWatchlistImportModal(true)}
+                    onExportLocal={() => setShowWatchlistExportModal(true)}
+                  />
                 </div>
               )}
             </div>
           </div>
-        ) : !loading && viewTab === "report" ? (
+        ) : !loading ? (
           <div className="space-y-8">
-            <div className="flex justify-center border-b border-slate-800 pb-1">
+            {/* Desktop Navigation Tabs */}
+            <div className="hidden sm:flex justify-center border-b border-slate-800 pb-1 gap-2">
+              <button
+                onClick={() => setViewTab("report")}
+                className={`px-6 py-3 rounded-t-xl text-base font-bold flex items-center transition-colors ${viewTab === "report" ? "bg-slate-800 text-amber-500 border-slate-700 border-t border-x" : "text-slate-500 hover:text-slate-300"}`}
+              >
+                <FileText className="w-5 h-5 inline mr-2" />
+                智能報告
+              </button>
               <button
                 onClick={() => setViewTab("screener")}
-                className="px-6 py-3 rounded-t-xl text-base font-bold text-slate-500 hover:text-slate-300 transition-colors"
+                className={`px-6 py-3 rounded-t-xl text-base font-bold flex items-center transition-colors ${viewTab === "screener" ? "bg-slate-800 text-amber-500 border-slate-700 border-t border-x" : "text-slate-500 hover:text-slate-300"}`}
               >
                 <Filter className="w-5 h-5 inline mr-2" />
                 篩選器
               </button>
+              <button
+                onClick={() => setViewTab("screenerWatchlist")}
+                className={`px-6 py-3 rounded-t-xl text-base font-bold flex items-center transition-colors ${viewTab === "screenerWatchlist" ? "bg-slate-800 text-amber-500 border-slate-700 border-t border-x" : "text-slate-500 hover:text-slate-300"}`}
+              >
+                <List className="w-5 h-5 inline mr-2" />
+                精選名單
+              </button>
+              <button
+                onClick={() => setViewTab("macroFilter")}
+                className={`px-6 py-3 rounded-t-xl text-base font-bold flex items-center transition-colors ${viewTab === "macroFilter" ? "bg-slate-800 text-amber-500 border-slate-700 border-t border-x" : "text-slate-500 hover:text-slate-300"}`}
+              >
+                <Activity className="w-5 h-5 inline mr-2" />
+                大盤濾網
+              </button>
+              <button
+                onClick={() => setViewTab("alphaMatrix")}
+                className={`px-6 py-3 rounded-t-xl text-base font-bold flex items-center transition-colors ${viewTab === "alphaMatrix" ? "bg-slate-800 text-amber-500 border-slate-700 border-t border-x" : "text-slate-500 hover:text-slate-300"}`}
+              >
+                <Cpu className="w-5 h-5 inline mr-2" />
+                個股微觀 Alpha 矩陣
+              </button>
+              <button
+                onClick={() => setViewTab("portfolio")}
+                className={`px-6 py-3 rounded-t-xl text-base font-bold flex items-center transition-colors ${viewTab === "portfolio" ? "bg-slate-800 text-amber-500 border-slate-700 border-t border-x" : "text-slate-500 hover:text-slate-300"}`}
+              >
+                <Briefcase className="w-5 h-5 inline mr-2" />
+                投資組合
+              </button>
             </div>
-            <div className="text-center py-24 opacity-20 flex flex-col items-center">
-              <Layers className="w-24 h-24 mb-6" />
-              <p className="text-2xl font-black">等待查詢中...</p>
+
+            {/* Mobile Navigation Tabs */}
+            <div className="flex sm:hidden flex-col gap-2 border-b border-slate-800/50 pb-3">
+              <div className="relative w-full overflow-hidden bg-slate-950/40 p-1 rounded-xl border border-slate-800/50 shadow-inner">
+                {/* Horizontal side scroll fade indicators */}
+                <div className="pointer-events-none absolute left-0 top-0 bottom-0 w-6 bg-gradient-to-r from-slate-950 to-transparent z-10" />
+                <div className="pointer-events-none absolute right-0 top-0 bottom-0 w-6 bg-gradient-to-l from-slate-950 to-transparent z-10" />
+                
+                <div className="flex gap-1 overflow-x-auto scrollbar-hide no-scrollbar py-0.5 px-1 scroll-smooth">
+                  {[
+                    { id: "report", label: "智能報告", icon: FileText },
+                    { id: "screener", label: "篩選器", icon: Filter },
+                    { id: "screenerWatchlist", label: "精選名單", icon: List },
+                    { id: "macroFilter", label: "大盤濾網", icon: Activity },
+                    { id: "alphaMatrix", label: "Alpha 矩陣", icon: Cpu },
+                    { id: "portfolio", label: "投資組合", icon: Briefcase }
+                  ].map((tab) => {
+                    const TabIcon = tab.icon;
+                    const isActive = viewTab === tab.id;
+                    return (
+                      <button
+                        key={tab.id}
+                        type="button"
+                        onClick={() => setViewTab(tab.id as any)}
+                        style={{ height: '44px' }}
+                        className={`flex items-center gap-1.5 px-3.5 rounded-lg text-xs font-black tracking-tight transition-all shrink-0 cursor-pointer ${
+                          isActive
+                            ? "bg-amber-600/15 text-amber-400 border border-amber-500/30 shadow-md"
+                            : "bg-transparent text-slate-400 hover:text-slate-200 border border-transparent"
+                        }`}
+                      >
+                        <TabIcon className={`w-3.5 h-3.5 ${isActive ? "text-amber-400" : "text-slate-500"}`} />
+                        <span>{tab.label}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
             </div>
+            
+            {viewTab === "report" && (
+              <div className="text-center py-24 opacity-20 flex flex-col items-center">
+                <Layers className="w-24 h-24 mb-6" />
+                <p className="text-2xl font-black">等待查詢中...</p>
+              </div>
+            )}
+            
+            {viewTab === "macroFilter" && (
+              <div className="animate-in fade-in duration-300">
+                <MacroFilterView />
+              </div>
+            )}
+            
+            {viewTab === "alphaMatrix" && (
+              <div className="animate-in fade-in duration-300 bg-slate-900 border border-slate-800 p-8 rounded-2xl max-w-2xl mx-auto text-center space-y-6 shadow-xl">
+                <div className="p-4 bg-amber-500/10 text-amber-500 rounded-full w-16 h-16 mx-auto flex items-center justify-center">
+                  <Cpu className="w-8 h-8 animate-pulse" />
+                </div>
+                <div className="space-y-2">
+                  <h3 className="text-xl font-bold text-slate-200">未偵測到分析中的個股 ⚠️</h3>
+                  <p className="text-sm text-slate-400 leading-relaxed max-w-md mx-auto">
+                    「個股微觀 Alpha 矩陣」需要公司個體數據才能啟動。請先在上方輸入股票代號（例如 <span className="text-amber-500 font-bold">NVDA</span> 或 <span className="text-amber-400 font-bold">AAPL</span>）並點擊「完整週期分析」研究。
+                  </p>
+                </div>
+                <div className="bg-slate-950 border border-slate-800 p-4 rounded-xl text-xs text-slate-500 leading-relaxed text-left space-y-2">
+                  <div className="font-bold text-slate-400 flex items-center gap-1">
+                     <Compass className="w-4 h-4 text-amber-500" />
+                    量化分析模型流程概要：
+                  </div>
+                  <p>● <strong>第一步：大盤環境濾網</strong> — 利用 40 訊號模型計算曝險，若分數 &lt; 0.4 自動調降 70% 權重或實施單一持倉 2% 限制。</p>
+                  <p>● <strong>第二步：個股微觀 Alpha 矩陣</strong> — 從基本面、籌碼情緒與技術動能 3 大維度提取 8 大核心因子建立定量評分卡。</p>
+                  <p>● <strong>第三步：個股部位權重優化</strong> — 動態融合（Sizing = Base_Weight * Stock_Score * Market_Exposure_Factor）進行部位映射。</p>
+                </div>
+              </div>
+            )}
+
+            {viewTab === "portfolio" && (
+              <div className="animate-in fade-in duration-300">
+                <PortfolioView
+                  currentPrices={cachedPrices}
+                  gdUser={gdUser}
+                  gdToken={gdToken}
+                  onGoogleDriveLogin={handleGoogleDriveLogin}
+                />
+              </div>
+            )}
+
+            {(viewTab === "screener" || viewTab === "screenerWatchlist") && (
+                <PriceScreener
+                  isWatchlistMode={viewTab === "screenerWatchlist"}
+                  selectedScreenerItems={selectedScreenerItems}
+                  onToggleScreenerItem={toggleScreenerItem}
+                  onImportLocal={() => setShowWatchlistImportModal(true)}
+                  onExportLocal={() => setShowWatchlistExportModal(true)}
+                />
+            )}
           </div>
-        ) : (
-          <div className="space-y-8">
-            {viewTab === "screener" && <PriceScreener />}
-          </div>
-        )}
+        ) : null}
       </main>
 
       <PortfolioModal
@@ -5471,12 +9019,18 @@ const App = () => {
         trades={trades}
         watchlist={watchlist}
         currentPrices={cachedPrices}
-        onDeleteTrade={(id: any) =>
-          setTrades((t) => t.filter((x) => x.id !== id))
-        }
-        onDeleteWatch={(s: any) =>
-          setWatchlist((w) => w.filter((x) => x.symbol !== s))
-        }
+        onDeleteTrade={(id: any) => {
+          setTrades((t) => t.filter((x) => x.id !== id));
+          if (gdUser) {
+            deleteTradeFromFirestore(gdUser.uid, id);
+          }
+        }}
+        onDeleteWatch={(s: any) => {
+          setWatchlist((w) => w.filter((x) => x.symbol !== s));
+          if (gdUser) {
+            deleteWatchlistItemFromFirestore(gdUser.uid, s);
+          }
+        }}
         onRefresh={refreshPrices}
         isUpdating={updatingPrices}
         onSyncToCloud={syncCloud}
@@ -5484,6 +9038,16 @@ const App = () => {
         onExport={handleExport}
         onImport={handleImport}
         onAddTrade={handleTrade}
+        isUpdatingWatchlist={updatingWatchlist}
+        watchlistUpdateProgress={watchlistUpdateProgress}
+        onUpdateAllWatchlistRatings={handleUpdateAllWatchlistRatings}
+        onDeleteWatchHistory={handleDeleteWatchHistory}
+        onClearWatchHistory={handleClearWatchHistory}
+        user={gdUser}
+        token={gdToken}
+        onLogin={handleGoogleDriveLogin}
+        onLogout={handleGoogleDriveLogout}
+        onLoadBackup={handleLoadGoogleDriveBackup}
       />
       <CloudSettingsModal
         isOpen={showSettings}
@@ -5498,6 +9062,89 @@ const App = () => {
       <ScoreExplanationModal
         isOpen={showScoreExplanation}
         onClose={() => setShowScoreExplanation(false)}
+      />
+
+      {/* Export Options Modal */}
+      <AnimatePresence>
+        {showWatchlistExportModal && (
+          <div className="fixed inset-0 z-[200] flex items-center justify-center p-4">
+            <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={() => setShowWatchlistExportModal(false)} className="absolute inset-0 bg-slate-950/80 backdrop-blur-sm" />
+            <motion.div initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 0.95 }} className="relative bg-slate-900 border border-slate-700 rounded-3xl p-6 w-full max-w-sm shadow-2xl z-10 overflow-hidden">
+              <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-amber-500 to-orange-500" />
+              <button onClick={() => setShowWatchlistExportModal(false)} className="absolute top-4 right-4 p-2 text-slate-500 hover:text-slate-300 hover:bg-slate-800 rounded-full transition-colors">
+                <X className="w-5 h-5" />
+              </button>
+              <h3 className="text-lg font-black text-white mb-6 flex items-center gap-2 tracking-wide"><Download className="w-5 h-5 text-amber-500" /> 匯出精選名單</h3>
+              
+              <div className="flex flex-col gap-3">
+                <button
+                  onClick={() => {
+                    handleExportSelected();
+                    setShowWatchlistExportModal(false);
+                  }}
+                  className="flex items-center justify-center gap-3 w-full p-4 rounded-2xl border border-slate-700 bg-slate-800 hover:bg-slate-700 hover:border-amber-500/50 transition-all font-bold text-white group"
+                >
+                  <Download className="w-5 h-5 text-slate-400 group-hover:text-amber-500" /> 備份至本機 (JSON)
+                </button>
+                <button
+                  onClick={handleDriveExportSelected}
+                  disabled={watchlistCloudLoading}
+                  className="flex items-center justify-center gap-3 w-full p-4 rounded-2xl border border-slate-700 bg-slate-800 hover:bg-slate-700 hover:border-sky-500/50 transition-all font-bold text-white group disabled:opacity-50"
+                >
+                  {watchlistCloudLoading ? <Loader2 className="w-5 h-5 animate-spin text-sky-400" /> : <CloudUpload className="w-5 h-5 text-slate-400 group-hover:text-sky-400" />} 備份至 Google Drive
+                </button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* Import Options Modal */}
+      <AnimatePresence>
+        {showWatchlistImportModal && (
+          <div className="fixed inset-0 z-[200] flex items-center justify-center p-4">
+            <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={() => setShowWatchlistImportModal(false)} className="absolute inset-0 bg-slate-950/80 backdrop-blur-sm" />
+            <motion.div initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 0.95 }} className="relative bg-slate-900 border border-slate-700 rounded-3xl p-6 w-full max-w-sm shadow-2xl z-10 overflow-hidden">
+              <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-emerald-500 to-teal-500" />
+              <button onClick={() => setShowWatchlistImportModal(false)} className="absolute top-4 right-4 p-2 text-slate-500 hover:text-slate-300 hover:bg-slate-800 rounded-full transition-colors">
+                <X className="w-5 h-5" />
+              </button>
+              <h3 className="text-lg font-black text-white mb-6 flex items-center gap-2 tracking-wide"><CloudUpload className="w-5 h-5 text-emerald-500" /> 匯入精選名單</h3>
+              
+              <div className="flex flex-col gap-3">
+                <button
+                  onClick={() => {
+                    handleImportSelected();
+                    setShowWatchlistImportModal(false);
+                  }}
+                  className="flex items-center justify-center gap-3 w-full p-4 rounded-2xl border border-slate-700 bg-slate-800 hover:bg-slate-700 hover:border-emerald-500/50 transition-all font-bold text-white group"
+                >
+                  <FileUp className="w-5 h-5 text-slate-400 group-hover:text-emerald-500" /> 從本機備份匯入 (JSON)
+                </button>
+                <button
+                  onClick={handleDriveImportSelected}
+                  disabled={watchlistCloudLoading}
+                  className="flex items-center justify-center gap-3 w-full p-4 rounded-2xl border border-slate-700 bg-slate-800 hover:bg-slate-700 hover:border-sky-500/50 transition-all font-bold text-white group disabled:opacity-50"
+                >
+                  {watchlistCloudLoading ? <Loader2 className="w-5 h-5 animate-spin text-sky-400" /> : <CloudDownload className="w-5 h-5 text-slate-400 group-hover:text-sky-400" />} 從 Google Drive 匯入
+                </button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      <GoogleDriveModal
+        isOpen={showGoogleDrive}
+        onClose={() => setShowGoogleDrive(false)}
+        user={gdUser}
+        token={gdToken}
+        onLogin={handleGoogleDriveLogin}
+        onLogout={handleGoogleDriveLogout}
+        trades={trades}
+        watchlist={watchlist}
+        onLoadBackup={handleLoadGoogleDriveBackup}
+        isLoggingIn={isLoggingIn}
       />
     </div>
   );

@@ -1,0 +1,45 @@
+{
+  "entities": {
+    "Trade": {
+      "title": "Trade",
+      "description": "A historic trading transaction or current portfolio position",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Unique trade ID" },
+        "symbol": { "type": "string", "description": "Stock symbol (ticker)" },
+        "name": { "type": "string", "description": "Stock company name" },
+        "type": { "type": "string", "enum": ["Buy", "MarginBuy", "Short", "Sell"], "description": "Transaction type" },
+        "price": { "type": "number", "description": "Price per share" },
+        "shares": { "type": "number", "description": "Number of shares" },
+        "date": { "type": "string", "description": "Human-readable transaction date" },
+        "timestamp": { "type": "number", "description": "Unix timestamp in ms" },
+        "userId": { "type": "string", "description": "The owning user ID" }
+      },
+      "required": ["id", "symbol", "name", "type", "price", "shares", "date", "timestamp", "userId"]
+    },
+    "WatchlistItem": {
+      "title": "WatchlistItem",
+      "description": "An asset being monitored by the user",
+      "type": "object",
+      "properties": {
+        "symbol": { "type": "string", "description": "Stock symbol (ticker)" },
+        "name": { "type": "string", "description": "Stock company name" },
+        "price": { "type": "number", "description": "Last observed stock price" },
+        "changePercent": { "type": "number", "description": "Last observed daily change percent" },
+        "timestamp": { "type": "number", "description": "Unix timestamp in ms of add/update" },
+        "userId": { "type": "string", "description": "The owning user ID" }
+      },
+      "required": ["symbol", "name", "price", "changePercent", "timestamp", "userId"]
+    }
+  },
+  "firestore": {
+    "users/{userId}/trades/{tradeId}": {
+      "schema": "Trade",
+      "description": "User's individual trade transactions"
+    },
+    "users/{userId}/watchlist/{symbol}": {
+      "schema": "WatchlistItem",
+      "description": "User's personal watchlists for active tracking"
+    }
+  }
+}

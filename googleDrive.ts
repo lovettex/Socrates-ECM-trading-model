@@ -1,39 +1,35 @@
-import { initializeApp } from "firebase/app";
 import {
-  getAuth,
   signInWithPopup,
   GoogleAuthProvider,
   onAuthStateChanged,
   User,
 } from "firebase/auth";
-import firebaseConfig from "./firebase-applet-config.json";
-
-// Initialize Firebase App and Auth once
-const app = initializeApp(firebaseConfig);
-const auth = getAuth(app);
+import { auth } from "./firebase";
 
 const provider = new GoogleAuthProvider();
-// Request Google Drive access scopes for storing files & folders
+// Request Google Workspace scopes for Sheets, Docs, Drive, and Chat
 provider.addScope("https://www.googleapis.com/auth/drive");
+provider.addScope("https://www.googleapis.com/auth/spreadsheets");
+provider.addScope("https://www.googleapis.com/auth/documents");
+provider.addScope("https://www.googleapis.com/auth/chat.spaces.readonly");
+provider.addScope("https://www.googleapis.com/auth/chat.messages.create");
 
 let isSigningIn = false;
 let cachedAccessToken: string | null = null;
 
 export const initAuth = (
-  onAuthSuccess?: (user: User, token: string) => void,
+  onAuthSuccess?: (user: User, token: string | null) => void,
   onAuthFailure?: () => void,
 ) => {
   return onAuthStateChanged(auth, async (user: User | null) => {
     if (user) {
-      if (cachedAccessToken) {
-        if (onAuthSuccess) onAuthSuccess(user, cachedAccessToken);
-      } else if (!isSigningIn) {
-        // Token has not been fetched through popup yet
-        cachedAccessToken = null;
-        if (onAuthFailure) onAuthFailure();
+      if (!cachedAccessToken) {
+        cachedAccessToken = localStorage.getItem("gdrive_access_token");
       }
+      if (onAuthSuccess) onAuthSuccess(user, cachedAccessToken);
     } else {
       cachedAccessToken = null;
+      localStorage.removeItem("gdrive_access_token");
       if (onAuthFailure) onAuthFailure();
     }
   });
@@ -43,6 +39,10 @@ export const googleSignIn = async (): Promise<{
   user: User;
   accessToken: string;
 } | null> => {
+  if (isSigningIn) {
+    console.warn("Sign-in process is already in progress.");
+    return null;
+  }
   try {
     isSigningIn = true;
     const result = await signInWithPopup(auth, provider);
@@ -52,8 +52,20 @@ export const googleSignIn = async (): Promise<{
       throw new Error("Failed to get Google Drive access token from Firebase login.");
     }
     cachedAccessToken = accessToken;
+    localStorage.setItem("gdrive_access_token", accessToken);
     return { user: result.user, accessToken };
   } catch (error: any) {
+    const errorCode = error?.code || "";
+    const errorMsg = error?.message || "";
+    if (
+      errorCode === "auth/cancelled-popup-request" ||
+      errorCode === "auth/popup-closed-by-user" ||
+      errorMsg.includes("cancelled-popup-request") ||
+      errorMsg.includes("popup-closed-by-user")
+    ) {
+      console.warn("Sign in process was cancelled or closed by user:", errorMsg);
+      return null;
+    }
     console.error("Sign in error:", error);
     throw error;
   } finally {
@@ -62,12 +74,16 @@ export const googleSignIn = async (): Promise<{
 };
 
 export const getAccessToken = async (): Promise<string | null> => {
+  if (!cachedAccessToken) {
+    cachedAccessToken = localStorage.getItem("gdrive_access_token");
+  }
   return cachedAccessToken;
 };
 
 export const logout = async () => {
   await auth.signOut();
   cachedAccessToken = null;
+  localStorage.removeItem("gdrive_access_token");
 };
 
 export interface DriveFile {
@@ -97,6 +113,11 @@ export const uploadFileToGoogleDrive = async (
           headers: { Authorization: `Bearer ${accessToken}` },
         },
       );
+      if (searchRes.status === 401) {
+        localStorage.removeItem("gdrive_access_token");
+        cachedAccessToken = null;
+        throw new Error("401_UNAUTHORIZED");
+      }
       if (searchRes.ok) {
         const searchData = await searchRes.json();
         if (searchData.files && searchData.files.length > 0) {
@@ -117,13 +138,21 @@ export const uploadFileToGoogleDrive = async (
               }),
             },
           );
+          if (createFolderRes.status === 401) {
+            localStorage.removeItem("gdrive_access_token");
+            cachedAccessToken = null;
+            throw new Error("401_UNAUTHORIZED");
+          }
           if (createFolderRes.ok) {
             const folderData = await createFolderRes.json();
             folderId = folderData.id;
           }
         }
       }
-    } catch (err) {
+    } catch (err: any) {
+      if (err.message === "401_UNAUTHORIZED") {
+        throw err;
+      }
       console.error("Failed to resolve folder, uploading to root:", err);
     }
   }
@@ -173,6 +202,11 @@ export const uploadFileToGoogleDrive = async (
   );
 
   if (!uploadRes.ok) {
+    if (uploadRes.status === 401) {
+      localStorage.removeItem("gdrive_access_token");
+      cachedAccessToken = null;
+      throw new Error("401_UNAUTHORIZED");
+    }
     const errorText = await uploadRes.text();
     throw new Error(`Google Drive upload failed: ${errorText}`);
   }
@@ -195,18 +229,26 @@ export const listBackupFilesFromGoogleDrive = async (
         headers: { Authorization: `Bearer ${accessToken}` },
       },
     );
+    if (folderRes.status === 401) {
+      localStorage.removeItem("gdrive_access_token");
+      cachedAccessToken = null;
+      throw new Error("401_UNAUTHORIZED");
+    }
     if (folderRes.ok) {
       const folderData = await folderRes.json();
       if (folderData.files && folderData.files.length > 0) {
         folderId = folderData.files[0].id;
       }
     }
-  } catch (err) {
+  } catch (err: any) {
+    if (err.message === "401_UNAUTHORIZED") {
+      throw err;
+    }
     console.error("Failed to find backup folder:", err);
   }
 
   let query =
-    "name contains 'Socrates_Portfolio_Backup' and mimeType='application/json' and trashed=false";
+    "(name contains 'Socrates_Portfolio_Backup' or name contains 'Socrates_Watchlist_Backup') and mimeType='application/json' and trashed=false";
   if (folderId) {
     query += ` and '${folderId}' in parents`;
   }
@@ -219,6 +261,11 @@ export const listBackupFilesFromGoogleDrive = async (
   );
 
   if (!res.ok) {
+    if (res.status === 401) {
+      localStorage.removeItem("gdrive_access_token");
+      cachedAccessToken = null;
+      throw new Error("401_UNAUTHORIZED");
+    }
     const err = await res.text();
     throw new Error(`Failed to list backups: ${err}`);
   }
@@ -241,6 +288,11 @@ export const downloadFileFromGoogleDrive = async (
     },
   );
   if (!res.ok) {
+    if (res.status === 401) {
+      localStorage.removeItem("gdrive_access_token");
+      cachedAccessToken = null;
+      throw new Error("401_UNAUTHORIZED");
+    }
     const err = await res.text();
     throw new Error(`Failed to download file: ${err}`);
   }
