@@ -17,6 +17,7 @@ import {
   Cloud,
   Loader2,
   CloudUpload,
+  HelpCircle,
 } from "lucide-react";
 import * as gdrive from "./googleDrive";
 
@@ -174,7 +175,8 @@ const getSectorColor = (sectorName: string) => {
 };
 
 const computeBubblePlan = (portfolio: any[], currentPrices: any) => {
-  const itemsWithValues = portfolio.map((item, idx) => {
+  const activePortfolio = portfolio.filter(item => item.direction !== "close");
+  const itemsWithValues = activePortfolio.map((item, idx) => {
     const market = currentPrices[item.symbol?.toUpperCase()];
     const currentPrice = Number(market?.price || item.avgPrice) || 0;
     const isShort = item.direction === "short";
@@ -331,7 +333,7 @@ export const PortfolioView: React.FC<PortfolioViewProps> = ({
   gdToken = null,
   onGoogleDriveLogin = () => {},
 }) => {
-  const [portfolio, setPortfolio] = useState<{ symbol: string; avgPrice: number; shares: number; note?: string; tradeType?: "simulation" | "real"; direction?: "buy" | "short"; purchaseDate?: string; selectedBatches?: string[] }[]>(() => {
+  const [portfolio, setPortfolio] = useState<{ symbol: string; avgPrice: number; shares: number; note?: string; tradeType?: "simulation" | "real"; direction?: "buy" | "short" | "close"; purchaseDate?: string; selectedBatches?: string[]; entryPrice?: number }[]>(() => {
     try {
       const saved = localStorage.getItem("watchlist_portfolio");
       return saved ? JSON.parse(saved) : [
@@ -355,7 +357,8 @@ export const PortfolioView: React.FC<PortfolioViewProps> = ({
   const [pShares, setPShares] = useState("");
   const [pNote, setPNote] = useState("");
   const [pTradeType, setPTradeType] = useState<"simulation" | "real">("simulation");
-  const [pDirection, setPDirection] = useState<"buy" | "short">("buy");
+  const [pDirection, setPDirection] = useState<"buy" | "short" | "close">("buy");
+  const [pEntryPrice, setPEntryPrice] = useState("");
   const [editingPIdx, setEditingPIdx] = useState<number | null>(null);
   const [pPurchaseDate, setPPurchaseDate] = useState("");
   const [pSelectedBatches, setPSelectedBatches] = useState<string[]>([]);
@@ -363,7 +366,7 @@ export const PortfolioView: React.FC<PortfolioViewProps> = ({
 
   const [portfolioSearchText, setPortfolioSearchText] = useState("");
   const [portfolioSelectedSector, setPortfolioSelectedSector] = useState("全部");
-  const [portfolioSelectedTradeType, setPortfolioSelectedTradeType] = useState<"all" | "real" | "simulation">("all");
+  const [portfolioSelectedTradeType, setPortfolioSelectedTradeType] = useState<"all" | "real" | "simulation" | "close">("all");
 
   const [confirmDeletePortfolioSymbol, setConfirmDeletePortfolioSymbol] = useState<string | null>(null);
 
@@ -380,9 +383,34 @@ export const PortfolioView: React.FC<PortfolioViewProps> = ({
     localStorage.setItem("watchlist_total_assets", totalAssetsStr);
   }, [totalAssetsStr]);
 
+  const [showInfoModal, setShowInfoModal] = useState(false);
+  const [infoActiveTab, setInfoActiveTab] = useState<"macro" | "alpha" | "capital">("macro");
+
   useEffect(() => {
     localStorage.setItem("watchlist_moomoo_leverage", moomooLeverage.toString());
   }, [moomooLeverage]);
+
+  // Autofill entry price, shares, and current price when flatting/closing a position
+  useEffect(() => {
+    if (showPortfolioAddForm && pDirection === "close" && editingPIdx === null && pSymbol.trim()) {
+      const sym = pSymbol.trim().toUpperCase();
+      const activeMatch = portfolio.find(item => 
+        item.symbol.toUpperCase() === sym &&
+        (item.tradeType || "real") === pTradeType &&
+        (item.direction === "buy" || item.direction === "short" || !item.direction)
+      );
+      if (activeMatch) {
+        setPEntryPrice(activeMatch.avgPrice.toString());
+        setPShares(activeMatch.shares.toString());
+        if (!pAvgPrice) {
+          const pricesObj = currentPrices || {};
+          const market = pricesObj[sym];
+          const curr = market?.price || activeMatch.avgPrice;
+          setPAvgPrice(curr.toString());
+        }
+      }
+    }
+  }, [showPortfolioAddForm, pSymbol, pDirection, pTradeType, editingPIdx, portfolio, currentPrices]);
 
   const [analysisResult, setAnalysisResult] = useState<any>(() => {
     try {
@@ -636,7 +664,7 @@ export const PortfolioView: React.FC<PortfolioViewProps> = ({
   }, [totalAssetsStr]);
 
   const realHoldingsPositions = useMemo(() => {
-    return portfolio.filter(item => (item.tradeType || "real") === "real");
+    return portfolio.filter(item => (item.tradeType || "real") === "real" && item.direction !== "close");
   }, [portfolio]);
 
   const totalRealHoldingsCost = useMemo(() => {
@@ -981,6 +1009,7 @@ export const PortfolioView: React.FC<PortfolioViewProps> = ({
     const sym = pSymbol.trim().toUpperCase();
     const priceNum = parseFloat(pAvgPrice) || 0;
     const sharesNum = parseFloat(pShares) || 0;
+    const entryPriceNum = pDirection === "close" ? (parseFloat(pEntryPrice) || 0) : 0;
 
     if (editingPIdx !== null) {
       setPortfolio(prev => {
@@ -993,46 +1022,121 @@ export const PortfolioView: React.FC<PortfolioViewProps> = ({
           tradeType: pTradeType,
           direction: pDirection,
           purchaseDate: pPurchaseDate,
-          selectedBatches: pSelectedBatches
+          selectedBatches: pSelectedBatches,
+          entryPrice: pDirection === "close" ? entryPriceNum : undefined
         };
         return next;
       });
       setEditingPIdx(null);
     } else {
-      const existingIdx = portfolio.findIndex(item => 
-        item.symbol === sym && 
-        (item.tradeType || "real") === pTradeType && 
-        (item.direction || "buy") === pDirection
-      );
-      if (existingIdx >= 0) {
+      if (pDirection === "close") {
         setPortfolio(prev => {
-          const next = [...prev];
-          const old = next[existingIdx];
-          const totalShares = old.shares + sharesNum;
-          const avgPrice = totalShares > 0 ? (old.avgPrice * old.shares + priceNum * sharesNum) / totalShares : 0;
-          next[existingIdx] = { 
-            symbol: sym, 
-            avgPrice, 
-            shares: totalShares, 
-            note: pNote || old.note,
-            tradeType: pTradeType,
-            direction: pDirection,
-            purchaseDate: pPurchaseDate || old.purchaseDate,
-            selectedBatches: Array.from(new Set([...(old.selectedBatches || []), ...pSelectedBatches]))
-          };
+          let next = [...prev];
+
+          // 1. Find and reduce the matching active position (buy or short)
+          const activeIdx = next.findIndex(item => 
+            item.symbol === sym && 
+            (item.tradeType || "real") === pTradeType && 
+            (item.direction === "buy" || item.direction === "short" || !item.direction)
+          );
+
+          if (activeIdx >= 0) {
+            const oldActive = next[activeIdx];
+            const remainingShares = oldActive.shares - sharesNum;
+            if (remainingShares <= 0) {
+              // Delete the active position completely because it's fully closed
+              next.splice(activeIdx, 1);
+            } else {
+              // Partially close the active position
+              next[activeIdx] = {
+                ...oldActive,
+                shares: remainingShares
+              };
+            }
+          }
+
+          // 2. Find if there's already some closed trade of this symbol & tradeType to merge
+          const existingCloseIdx = next.findIndex(item =>
+            item.symbol === sym &&
+            (item.tradeType || "real") === pTradeType &&
+            item.direction === "close"
+          );
+
+          if (existingCloseIdx >= 0) {
+            const oldClose = next[existingCloseIdx];
+            const totalCloseShares = oldClose.shares + sharesNum;
+            const avgClosePrice = totalCloseShares > 0 
+              ? (oldClose.avgPrice * oldClose.shares + priceNum * sharesNum) / totalCloseShares 
+              : 0;
+            const oldCloseEntry = oldClose.entryPrice || 0;
+            const avgCloseEntryPrice = totalCloseShares > 0
+              ? (oldCloseEntry * oldClose.shares + entryPriceNum * sharesNum) / totalCloseShares
+              : 0;
+            
+            next[existingCloseIdx] = {
+              symbol: sym,
+              avgPrice: avgClosePrice,
+              shares: totalCloseShares,
+              note: pNote || oldClose.note,
+              tradeType: pTradeType,
+              direction: "close",
+              purchaseDate: pPurchaseDate || oldClose.purchaseDate,
+              selectedBatches: Array.from(new Set([...(oldClose.selectedBatches || []), ...pSelectedBatches])),
+              entryPrice: avgCloseEntryPrice
+            };
+          } else {
+            next.push({
+              symbol: sym,
+              avgPrice: priceNum,
+              shares: sharesNum,
+              note: pNote,
+              tradeType: pTradeType,
+              direction: "close",
+              purchaseDate: pPurchaseDate,
+              selectedBatches: pSelectedBatches,
+              entryPrice: entryPriceNum
+            });
+          }
+
           return next;
         });
       } else {
-        setPortfolio(prev => [...prev, { 
-          symbol: sym, 
-          avgPrice: priceNum, 
-          shares: sharesNum, 
-          note: pNote,
-          tradeType: pTradeType,
-          direction: pDirection,
-          purchaseDate: pPurchaseDate,
-          selectedBatches: pSelectedBatches
-        }]);
+        // Normal Buy/Short flow
+        const existingIdx = portfolio.findIndex(item => 
+          item.symbol === sym && 
+          (item.tradeType || "real") === pTradeType && 
+          (item.direction || "buy") === pDirection
+        );
+        if (existingIdx >= 0) {
+          setPortfolio(prev => {
+            const next = [...prev];
+            const old = next[existingIdx];
+            const totalShares = old.shares + sharesNum;
+            const avgPrice = totalShares > 0 ? (old.avgPrice * old.shares + priceNum * sharesNum) / totalShares : 0;
+            next[existingIdx] = { 
+              symbol: sym, 
+              avgPrice, 
+              shares: totalShares, 
+              note: pNote || old.note,
+              tradeType: pTradeType,
+              direction: pDirection,
+              purchaseDate: pPurchaseDate || old.purchaseDate,
+              selectedBatches: Array.from(new Set([...(old.selectedBatches || []), ...pSelectedBatches]))
+            };
+            return next;
+          });
+        } else {
+          setPortfolio(prev => [...prev, { 
+            symbol: sym, 
+            avgPrice: priceNum, 
+            shares: sharesNum, 
+            note: pNote,
+            tradeType: pTradeType,
+            direction: pDirection,
+            purchaseDate: pPurchaseDate,
+            selectedBatches: pSelectedBatches
+          }]);
+        }
       }
     }
 
@@ -1045,11 +1149,43 @@ export const PortfolioView: React.FC<PortfolioViewProps> = ({
     setShowBatchDropdown(false);
     setPTradeType("simulation");
     setPDirection("buy");
+    setPEntryPrice("");
     setShowPortfolioAddForm(false);
   };
 
   return (
     <div className="space-y-6">
+      {/* Socrates Portfolio Help Banner and ? icon trigger */}
+      <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 bg-slate-900/30 border border-slate-800/60 p-4 px-5 rounded-2xl">
+        <div className="flex items-center gap-3 w-full sm:w-auto">
+          <div className="p-2 bg-amber-500/10 border border-amber-500/20 rounded-xl">
+            <Briefcase className="w-5 h-5 text-amber-500" />
+          </div>
+          <div>
+            <div className="flex items-center gap-2">
+              <span className="text-[10px] font-black text-amber-400 font-mono tracking-widest uppercase bg-amber-500/10 px-1.5 py-0.5 rounded border border-amber-500/20">
+                Socrates Alpha Engine
+              </span>
+              <span className="text-slate-500 font-mono text-[9px] font-black">v2.1</span>
+            </div>
+            <h3 className="text-sm font-black text-slate-100 tracking-wider mt-0.5 font-sans">
+              智慧資金與部位映射工作區
+            </h3>
+          </div>
+        </div>
+        <button
+          type="button"
+          onClick={() => {
+            setInfoActiveTab("macro");
+            setShowInfoModal(true);
+          }}
+          className="flex items-center gap-2 px-3.5 py-2 text-xs font-bold bg-slate-800 hover:bg-slate-750 text-amber-400 hover:text-amber-300 border border-slate-700/80 hover:border-amber-500/30 rounded-xl transition-all cursor-pointer shadow-lg hover:shadow-amber-500/5 group w-full sm:w-auto justify-center"
+        >
+          <HelpCircle className="w-3.5 h-3.5 text-amber-500 group-hover:scale-110 transition-transform" />
+          <span>檢視系統運算與模型邏輯說明</span>
+        </button>
+      </div>
+
       {/* 1. Portfolio Industry Sectors Bubble Chart / AI Comparison Slider */}
       <div className="bg-slate-950/60 border border-slate-800/80 rounded-2xl p-6 overflow-hidden relative">
         <style>{`
@@ -1117,7 +1253,7 @@ export const PortfolioView: React.FC<PortfolioViewProps> = ({
             {portfolio.length > 0 && (
               <span className="text-[11px] text-slate-400 font-mono font-black bg-slate-900 border border-slate-800 px-3 py-1 rounded">
                 總資產市值: ${(() => {
-                  const value = portfolio.reduce((acc, item) => {
+                  const value = portfolio.filter(item => item.direction !== "close").reduce((acc, item) => {
                     const market = currentPrices[item.symbol?.toUpperCase()];
                     const currentPrice = Number(market?.price || item.avgPrice) || 0;
                     const isShort = item.direction === "short";
@@ -1900,6 +2036,7 @@ export const PortfolioView: React.FC<PortfolioViewProps> = ({
             setPNote("");
             setPTradeType("simulation");
             setPDirection("buy");
+            setPEntryPrice("");
             setShowPortfolioAddForm(true);
           }}
           className="flex items-center justify-center gap-1.5 bg-amber-600 hover:bg-amber-500 text-white px-4 py-2.5 rounded-xl font-bold text-xs transition-all shadow-[0_4px_12px_rgba(217,119,6,0.15)] select-none shrink-0 cursor-pointer"
@@ -1926,7 +2063,7 @@ export const PortfolioView: React.FC<PortfolioViewProps> = ({
             </button>
           </div>
 
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+          <div className={`grid grid-cols-1 ${pDirection === "close" ? "sm:grid-cols-4" : "sm:grid-cols-3"} gap-3`}>
             <div className="space-y-1.5">
               <label className="text-[10px] text-slate-400 block font-bold">股票代號</label>
               <input
@@ -1939,22 +2076,53 @@ export const PortfolioView: React.FC<PortfolioViewProps> = ({
                 className="w-full bg-slate-950 border border-slate-800 rounded-lg p-2.5 text-xs text-white font-mono uppercase focus:border-amber-500 focus:outline-none"
               />
             </div>
+            {pDirection === "close" ? (
+              <>
+                <div className="space-y-1.5">
+                  <label className="text-[10px] text-slate-400 block font-bold font-sans">開倉成本價 (買入均價)</label>
+                  <input
+                    type="number"
+                    required
+                    step="any"
+                    placeholder="開倉成本"
+                    value={pEntryPrice}
+                    onChange={(e) => setPEntryPrice(e.target.value)}
+                    className="w-full bg-slate-950 border border-slate-800 rounded-lg p-2.5 text-xs text-white font-mono focus:border-amber-500 focus:outline-none"
+                  />
+                </div>
+                <div className="space-y-1.5">
+                  <label className="text-[10px] text-slate-400 block font-bold font-sans">結算平倉價 (平倉均價)</label>
+                  <input
+                    type="number"
+                    required
+                    step="any"
+                    placeholder="平倉均價"
+                    value={pAvgPrice}
+                    onChange={(e) => setPAvgPrice(e.target.value)}
+                    className="w-full bg-slate-950 border border-slate-800 rounded-lg p-2.5 text-xs text-white font-mono focus:border-amber-500 focus:outline-none"
+                  />
+                </div>
+              </>
+            ) : (
+              <div className="space-y-1.5">
+                <label className="text-[10px] text-slate-400 block font-bold font-sans">
+                  {pDirection === "short" ? "平均融券賣出價" : "平均買入價"}
+                </label>
+                <input
+                  type="number"
+                  required
+                  step="any"
+                  placeholder="股價"
+                  value={pAvgPrice}
+                  onChange={(e) => setPAvgPrice(e.target.value)}
+                  className="w-full bg-slate-950 border border-slate-800 rounded-lg p-2.5 text-xs text-white font-mono focus:border-amber-500 focus:outline-none"
+                />
+              </div>
+            )}
             <div className="space-y-1.5">
-              <label className="text-[10px] text-slate-400 block font-bold font-sans">
-                {pDirection === "short" ? "平均融券賣出價" : "平均買入價"}
+              <label className="text-[10px] text-slate-400 block font-bold">
+                {pDirection === "close" ? "平倉/結算股數" : "持有股數"}
               </label>
-              <input
-                type="number"
-                required
-                step="any"
-                placeholder="股價"
-                value={pAvgPrice}
-                onChange={(e) => setPAvgPrice(e.target.value)}
-                className="w-full bg-slate-950 border border-slate-800 rounded-lg p-2.5 text-xs text-white font-mono focus:border-amber-500 focus:outline-none"
-              />
-            </div>
-            <div className="space-y-1.5">
-              <label className="text-[10px] text-slate-400 block font-bold">持有股數</label>
               <input
                 type="number"
                 required
@@ -1988,10 +2156,13 @@ export const PortfolioView: React.FC<PortfolioViewProps> = ({
               >
                 <option value="buy">買進</option>
                 <option value="short">融券賣出</option>
+                <option value="close">平倉</option>
               </select>
             </div>
             <div className="space-y-1.5">
-              <label className="text-[10px] text-slate-400 block font-bold">入庫日期 (新增日期)</label>
+              <label className="text-[10px] text-slate-400 block font-bold">
+                {pDirection === "close" ? "結算平倉日期" : "入庫日期 (新增日期)"}
+              </label>
               <input
                 type="date"
                 value={pPurchaseDate}
@@ -2107,6 +2278,7 @@ export const PortfolioView: React.FC<PortfolioViewProps> = ({
               setPNote("");
               setPTradeType("simulation");
               setPDirection("buy");
+              setPEntryPrice("");
               setShowPortfolioAddForm(true);
             }}
             className="mt-4 px-4 py-2 bg-slate-800 hover:bg-slate-700 text-amber-400 border border-slate-700 rounded-xl text-xs font-bold transition-all"
@@ -2121,15 +2293,22 @@ export const PortfolioView: React.FC<PortfolioViewProps> = ({
             {[
               { id: "all", label: "全部交易模式" },
               { id: "real", label: "真實交易" },
-              { id: "simulation", label: "模擬交易" }
+              { id: "simulation", label: "模擬交易" },
+              { id: "close", label: "平倉交易" }
             ].map((tab) => {
               const isSelected = portfolioSelectedTradeType === tab.id;
               const count = portfolio.filter((item: any) => {
                 const matchesSearch = !portfolioSearchText.trim() ||
                   item.symbol.toLowerCase().includes(portfolioSearchText.toLowerCase()) ||
                   (item.note && item.note.toLowerCase().includes(portfolioSearchText.toLowerCase()));
-                const matchesTradeType = tab.id === "all" || (item.tradeType || "real") === tab.id;
-                return matchesSearch && matchesTradeType;
+                
+                if (tab.id === "close") {
+                  return matchesSearch && item.direction === "close";
+                } else {
+                  if (item.direction === "close") return false;
+                  const matchesTradeType = tab.id === "all" || (item.tradeType || "real") === tab.id;
+                  return matchesSearch && matchesTradeType;
+                }
               }).length;
 
               return (
@@ -2146,6 +2325,7 @@ export const PortfolioView: React.FC<PortfolioViewProps> = ({
                   <span className="flex items-center gap-1.5">
                     {tab.id === "real" && <span className="w-1.5 h-1.5 rounded-full bg-teal-400" />}
                     {tab.id === "simulation" && <span className="w-1.5 h-1.5 rounded-full bg-slate-400" />}
+                    {tab.id === "close" && <span className="w-1.5 h-1.5 rounded-full bg-amber-500" />}
                     <span>{tab.label}</span>
                   </span>
                   <span className={`text-[9px] px-1.5 py-0.5 rounded-full font-mono ${
@@ -2171,7 +2351,14 @@ export const PortfolioView: React.FC<PortfolioViewProps> = ({
               const sectorsInP = Array.from(
                 new Set(
                   portfolio
-                    .filter((item: any) => portfolioSelectedTradeType === "all" || (item.tradeType || "real") === portfolioSelectedTradeType)
+                    .filter((item: any) => {
+                      if (portfolioSelectedTradeType === "close") {
+                        return item.direction === "close";
+                      } else {
+                        if (item.direction === "close") return false;
+                        return portfolioSelectedTradeType === "all" || (item.tradeType || "real") === portfolioSelectedTradeType;
+                      }
+                    })
                     .map((item: any) => getTradingViewHeatmapSector(item.symbol))
                 )
               ).filter(Boolean).sort() as string[];
@@ -2182,7 +2369,15 @@ export const PortfolioView: React.FC<PortfolioViewProps> = ({
                   const matchesSearch = !portfolioSearchText.trim() ||
                     item.symbol.toLowerCase().includes(portfolioSearchText.toLowerCase()) ||
                     (item.note && item.note.toLowerCase().includes(portfolioSearchText.toLowerCase()));
-                  const matchesTradeType = portfolioSelectedTradeType === "all" || (item.tradeType || "real") === portfolioSelectedTradeType;
+                  
+                  let matchesTradeType = false;
+                  if (portfolioSelectedTradeType === "close") {
+                    matchesTradeType = item.direction === "close";
+                  } else {
+                    if (item.direction === "close") return false;
+                    matchesTradeType = portfolioSelectedTradeType === "all" || (item.tradeType || "real") === portfolioSelectedTradeType;
+                  }
+
                   const itemSector = getTradingViewHeatmapSector(item.symbol);
                   return matchesSearch && matchesTradeType && (sectorName === "全體" || itemSector === sectorName);
                 }).length;
@@ -2227,7 +2422,15 @@ export const PortfolioView: React.FC<PortfolioViewProps> = ({
                 const matchesSearch = !portfolioSearchText.trim() ||
                   item.symbol.toLowerCase().includes(portfolioSearchText.toLowerCase()) ||
                   (item.note && item.note.toLowerCase().includes(portfolioSearchText.toLowerCase()));
-                const matchesTradeType = portfolioSelectedTradeType === "all" || (item.tradeType || "real") === portfolioSelectedTradeType;
+                
+                let matchesTradeType = false;
+                if (portfolioSelectedTradeType === "close") {
+                  matchesTradeType = item.direction === "close";
+                } else {
+                  if (item.direction === "close") return false;
+                  matchesTradeType = portfolioSelectedTradeType === "all" || (item.tradeType || "real") === portfolioSelectedTradeType;
+                }
+
                 const itemSector = getTradingViewHeatmapSector(item.symbol);
                 const matchesSector = portfolioSelectedSector === "全部" || itemSector === portfolioSelectedSector;
                 return matchesSearch && matchesTradeType && matchesSector;
@@ -2246,8 +2449,20 @@ export const PortfolioView: React.FC<PortfolioViewProps> = ({
                 const currentPrice = Number(market?.price || item.avgPrice) || 0;
                 const isShort = item.direction === "short";
                 const isSim = item.tradeType === "simulation";
-                const profit = isShort ? (item.avgPrice - currentPrice) * item.shares : (currentPrice - item.avgPrice) * item.shares;
-                const profitPercent = item.avgPrice > 0 ? (isShort ? ((item.avgPrice - currentPrice) / item.avgPrice) * 100 : ((currentPrice - item.avgPrice) / item.avgPrice) * 100) : 0;
+                const isClose = item.direction === "close";
+                const entry = item.entryPrice || 0;
+                
+                const profit = isClose
+                  ? (item.avgPrice - entry) * item.shares
+                  : isShort
+                  ? (item.avgPrice - currentPrice) * item.shares
+                  : (currentPrice - item.avgPrice) * item.shares;
+
+                const profitPercent = isClose
+                  ? (entry > 0 ? ((item.avgPrice - entry) / entry) * 100 : 0)
+                  : item.avgPrice > 0
+                  ? (isShort ? ((item.avgPrice - currentPrice) / item.avgPrice) * 100 : ((currentPrice - item.avgPrice) / item.avgPrice) * 100)
+                  : 0;
                 
                 const itemKey = `${item.symbol}_${item.tradeType || "real"}_${item.direction || "buy"}`;
                 const isSelected = selectedPortfolioSymbol === itemKey || 
@@ -2274,16 +2489,26 @@ export const PortfolioView: React.FC<PortfolioViewProps> = ({
                         <span className={`text-[8px] px-1 rounded font-bold scale-90 ${isSim ? "bg-slate-800 text-slate-400" : "bg-teal-500/20 text-teal-400"}`}>
                           {isSim ? "模" : "實"}
                         </span>
-                        <span className={`text-[8px] px-1 rounded font-bold scale-90 ${isShort ? "bg-rose-500/20 text-rose-400" : "bg-emerald-500/20 text-emerald-400"}`}>
-                          {isShort ? "融" : "買"}
-                        </span>
+                        {item.direction === "close" ? (
+                          <span className="text-[8px] px-1 rounded font-bold scale-90 bg-amber-500/20 text-amber-400">
+                            平
+                          </span>
+                        ) : isShort ? (
+                          <span className="text-[8px] px-1 rounded font-bold scale-90 bg-rose-500/20 text-rose-400">
+                            融
+                          </span>
+                        ) : (
+                          <span className="text-[8px] px-1 rounded font-bold scale-90 bg-emerald-500/20 text-emerald-400">
+                            買
+                          </span>
+                        )}
                       </span>
                       <span className={`text-[10px] font-mono font-bold ${profit >= 0 ? "text-emerald-400" : "text-red-400"}`}>
                         {profit >= 0 ? "+" : ""}{profitPercent.toFixed(1)}%
                       </span>
                     </span>
                     <span className="text-[9px] opacity-75 font-normal mt-0.5 font-mono">
-                      {item.shares} 股 / {isShort ? "融均" : "均價"} ${item.avgPrice.toFixed(1)}
+                      {item.shares} 股 / {item.direction === "close" ? "結算" : isShort ? "融均" : "均價"} ${item.avgPrice.toFixed(1)}
                     </span>
                   </button>
                 );
@@ -2297,7 +2522,15 @@ export const PortfolioView: React.FC<PortfolioViewProps> = ({
               const matchesSearch = !portfolioSearchText.trim() ||
                 item.symbol.toLowerCase().includes(portfolioSearchText.toLowerCase()) ||
                 (item.note && item.note.toLowerCase().includes(portfolioSearchText.toLowerCase()));
-              const matchesTradeType = portfolioSelectedTradeType === "all" || (item.tradeType || "real") === portfolioSelectedTradeType;
+              
+              let matchesTradeType = false;
+              if (portfolioSelectedTradeType === "close") {
+                matchesTradeType = item.direction === "close";
+              } else {
+                if (item.direction === "close") return false;
+                matchesTradeType = portfolioSelectedTradeType === "all" || (item.tradeType || "real") === portfolioSelectedTradeType;
+              }
+
               const itemSector = getTradingViewHeatmapSector(item.symbol);
               const matchesSector = portfolioSelectedSector === "全部" || itemSector === portfolioSelectedSector;
               return matchesSearch && matchesTradeType && matchesSector;
@@ -2320,8 +2553,20 @@ export const PortfolioView: React.FC<PortfolioViewProps> = ({
             const currentPrice = Number(market?.price || activeItem.avgPrice) || 0;
             const isShort = activeItem.direction === "short";
             const isSim = activeItem.tradeType === "simulation";
-            const profit = isShort ? (activeItem.avgPrice - currentPrice) * activeItem.shares : (currentPrice - activeItem.avgPrice) * activeItem.shares;
-            const profitPercent = activeItem.avgPrice > 0 ? (isShort ? ((activeItem.avgPrice - currentPrice) / activeItem.avgPrice) * 100 : ((currentPrice - activeItem.avgPrice) / activeItem.avgPrice) * 100) : 0;
+            const isClose = activeItem.direction === "close";
+            const entry = activeItem.entryPrice || 0;
+            
+            const profit = isClose
+              ? (activeItem.avgPrice - entry) * activeItem.shares
+              : isShort
+              ? (activeItem.avgPrice - currentPrice) * activeItem.shares
+              : (currentPrice - activeItem.avgPrice) * activeItem.shares;
+
+            const profitPercent = isClose
+              ? (entry > 0 ? ((activeItem.avgPrice - entry) / entry) * 100 : 0)
+              : activeItem.avgPrice > 0
+              ? (isShort ? ((activeItem.avgPrice - currentPrice) / activeItem.avgPrice) * 100 : ((currentPrice - activeItem.avgPrice) / activeItem.avgPrice) * 100)
+              : 0;
 
             return (
               <div className="bg-slate-900/50 border border-slate-800/80 rounded-2xl p-5 space-y-4 animate-in fade-in duration-200">
@@ -2332,15 +2577,48 @@ export const PortfolioView: React.FC<PortfolioViewProps> = ({
                     <span className={`text-[10px] px-2 py-0.5 rounded font-bold ${isSim ? "bg-slate-800 text-slate-400 border border-slate-700/40" : "bg-teal-500/10 text-teal-400 border border-teal-500/20"}`}>
                       {isSim ? "模擬交易" : "真實交易"}
                     </span>
-                    <span className={`text-[10px] px-2 py-0.5 rounded font-bold ${isShort ? "bg-rose-500/10 text-rose-400 border border-rose-500/20" : "bg-emerald-500/10 text-emerald-400 border border-emerald-500/20"}`}>
-                      {isShort ? "融券賣出" : "買進手數"}
-                    </span>
+                    {activeItem.direction === "close" ? (
+                      <span className="text-[10px] px-2 py-0.5 rounded font-bold bg-amber-500/10 text-amber-400 border border-amber-500/20">
+                        平倉交易
+                      </span>
+                    ) : isShort ? (
+                      <span className={`text-[10px] px-2 py-0.5 rounded font-bold bg-rose-500/10 text-rose-400 border border-rose-500/20`}>
+                        融券賣出
+                      </span>
+                    ) : (
+                      <span className={`text-[10px] px-2 py-0.5 rounded font-bold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20`}>
+                        買進手數
+                      </span>
+                    )}
                     <span className="text-xs text-slate-400 bg-slate-900/80 px-2.5 py-0.5 rounded border border-slate-800/60 max-w-[150px] line-clamp-1">
                       {getTradingViewHeatmapSector(activeItem.symbol).split(" (")[0]}
                     </span>
                   </div>
                   
                   <div className="flex gap-2">
+                    {activeItem.direction !== "close" && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setEditingPIdx(null);
+                          setPSymbol(activeItem.symbol);
+                          setPTradeType(activeItem.tradeType || "real");
+                          setPDirection("close");
+                          setPEntryPrice(activeItem.avgPrice.toString());
+                          const currentPricesObj = currentPrices || {};
+                          const marketPrice = currentPricesObj[activeItem.symbol?.toUpperCase()]?.price || activeItem.avgPrice;
+                          setPAvgPrice(marketPrice.toString());
+                          setPShares(activeItem.shares.toString());
+                          setPPurchaseDate(new Date().toISOString().split('T')[0]);
+                          setPNote(`結算平倉 ${activeItem.symbol}`);
+                          setShowBatchDropdown(false);
+                          setShowPortfolioAddForm(true);
+                        }}
+                        className="px-3.5 py-1.5 text-xs bg-amber-500/15 hover:bg-amber-500/25 text-amber-400 border border-amber-500/20 rounded-lg font-bold transition-all cursor-pointer"
+                      >
+                        快捷平倉
+                      </button>
+                    )}
                     <button
                       type="button"
                       onClick={() => {
@@ -2354,6 +2632,7 @@ export const PortfolioView: React.FC<PortfolioViewProps> = ({
                         setPNote(activeItem.note || "");
                         setPTradeType(activeItem.tradeType || "real");
                         setPDirection(activeItem.direction || "buy");
+                        setPEntryPrice(activeItem.entryPrice ? activeItem.entryPrice.toString() : "");
                         setShowPortfolioAddForm(true);
                       }}
                       className="px-3.5 py-1.5 text-xs bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700/80 rounded-lg font-bold transition-all cursor-pointer"
@@ -2374,33 +2653,45 @@ export const PortfolioView: React.FC<PortfolioViewProps> = ({
                 <div className="grid grid-cols-2 md:grid-cols-4 gap-4 pt-1">
                   <div className="space-y-1">
                     <span className="text-[10px] text-slate-500 font-extrabold block">
-                      {isShort ? "我的平均融券價" : "我的平均買價"}
+                      {activeItem.direction === "close"
+                        ? "平倉結算價格"
+                        : isShort
+                        ? "我的平均融券價"
+                        : "我的平均買價"}
                     </span>
                     <span className="text-base font-mono font-bold text-slate-300">
                       ${activeItem.avgPrice.toLocaleString(undefined, { minimumFractionDigits: 1 })}
                     </span>
                   </div>
                   <div className="space-y-1">
-                    <span className="text-[10px] text-slate-500 font-extrabold block">當前市場參考價</span>
+                    <span className="text-[10px] text-slate-500 font-extrabold block">
+                      {activeItem.direction === "close" ? "開倉持股成本價" : "當前市場參考價"}
+                    </span>
                     <span className="text-base font-mono font-bold text-amber-500">
-                      ${currentPrice.toLocaleString(undefined, { minimumFractionDigits: 1 })}
+                      ${(activeItem.direction === "close" ? (activeItem.entryPrice || 0) : currentPrice).toLocaleString(undefined, { minimumFractionDigits: 1 })}
                     </span>
                   </div>
                   <div className="space-y-1">
-                    <span className="text-[10px] text-slate-500 font-extrabold block">持有庫存股數</span>
+                    <span className="text-[10px] text-slate-500 font-extrabold block">
+                      {activeItem.direction === "close" ? "結算平倉股數" : "持有庫存股數"}
+                    </span>
                     <span className="text-base font-mono font-bold text-slate-300">
                       {activeItem.shares} 股
                     </span>
                   </div>
                   <div className="space-y-1">
-                    <span className="text-[10px] text-slate-500 font-extrabold block">個股預估損益</span>
+                    <span className="text-[10px] text-slate-500 font-extrabold block">
+                      {activeItem.direction === "close" ? "實現交易損益" : "個股預估損益"}
+                    </span>
                     <span className={`text-base font-mono font-black ${profit >= 0 ? "text-emerald-400" : "text-red-400"}`}>
                       {profit >= 0 ? "+" : ""}{profit.toLocaleString(undefined, { minimumFractionDigits: 1 })}
                       <span className="text-xs font-bold ml-2 opacity-90">({profit >= 0 ? "+" : ""}{profitPercent.toFixed(2)}%)</span>
                     </span>
                   </div>
                   <div className="space-y-1">
-                    <span className="text-[10px] text-slate-500 font-extrabold block">入庫日期 (新增日期)</span>
+                    <span className="text-[10px] text-slate-500 font-extrabold block">
+                      {activeItem.direction === "close" ? "結算平倉日期" : "入庫日期 (新增日期)"}
+                    </span>
                     <span className="text-xs font-mono font-bold text-slate-300">
                       {activeItem.purchaseDate || "未設定"}
                     </span>
@@ -2425,7 +2716,7 @@ export const PortfolioView: React.FC<PortfolioViewProps> = ({
                 </div>
 
                 {/* 7. Moomoo 融資分批進場建案 (Only for Real Transactions) */}
-                {!isSim && (() => {
+                {!isSim && !isClose && (() => {
                   const totalHeldShares = activeItem.shares || 0;
                   let remainingActualShares = totalHeldShares;
 
@@ -2718,7 +3009,7 @@ export const PortfolioView: React.FC<PortfolioViewProps> = ({
                   setShowImportModal(false);
                   setGdStatusMsg("");
                 }}
-                className="text-slate-400 hover:text-white transition-colors bg-slate-800 p-1.5 rounded-lg disabled:opacity-50"
+                className="text-slate-400 hover:text-white transition-colors bg-slate-800 p-1.5 rounded-lg disabled:opacity-50 cursor-pointer"
               >
                 <X className="w-4 h-4" />
               </button>
@@ -2731,7 +3022,7 @@ export const PortfolioView: React.FC<PortfolioViewProps> = ({
                 onClick={handleLocalImport}
                 className="w-full flex items-center gap-4 bg-slate-800 hover:bg-slate-750 border border-slate-700/80 p-4 rounded-xl text-left transition-all hover:border-amber-500/30 cursor-pointer"
               >
-                <div className="p-2.5 bg-amber-500/10 rounded-lg text-amber-500">
+                <div className="p-2.5 bg-amber-500/10 rounded-lg text-amber-500 font-bold">
                   <Upload className="w-5 h-5" />
                 </div>
                 <div className="flex-1">
@@ -2754,7 +3045,7 @@ export const PortfolioView: React.FC<PortfolioViewProps> = ({
                   onClick={handleCloudImport}
                   className="w-full flex items-center gap-4 bg-slate-800 hover:bg-slate-750 border border-slate-700/80 p-4 rounded-xl text-left transition-all hover:border-emerald-500/30 cursor-pointer"
                 >
-                  <div className="p-2.5 bg-emerald-500/10 rounded-lg text-emerald-500">
+                  <div className="p-2.5 bg-emerald-500/10 rounded-lg text-emerald-500 font-bold">
                     {isOperatingGD ? (
                       <Loader2 className="w-5 h-5 animate-spin" />
                     ) : (
@@ -2794,7 +3085,7 @@ export const PortfolioView: React.FC<PortfolioViewProps> = ({
               <button
                 type="button"
                 onClick={() => setConfirmDeletePortfolioSymbol(null)}
-                className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-xl text-xs font-bold transition-all border border-slate-700"
+                className="px-4 py-2 bg-slate-800 hover:bg-slate-750 text-slate-300 rounded-xl text-xs font-bold transition-all border border-slate-700 cursor-pointer"
               >
                 取消
               </button>
@@ -2807,9 +3098,424 @@ export const PortfolioView: React.FC<PortfolioViewProps> = ({
                   }
                   setConfirmDeletePortfolioSymbol(null);
                 }}
-                className="px-4 py-2 bg-rose-600 hover:bg-rose-500 text-white rounded-xl text-xs font-bold transition-all shadow-md"
+                className="px-4 py-2 bg-rose-600 hover:bg-rose-500 text-white rounded-xl text-xs font-bold transition-all shadow-md cursor-pointer"
               >
                 確認移除
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {showInfoModal && (
+        <div className="fixed inset-0 z-[250] flex items-center justify-center p-4 font-sans">
+          {/* Flat deep backdrop overlay with no blur */}
+          <div className="absolute inset-0 bg-[#06080d]/90" onClick={() => setShowInfoModal(false)} />
+          
+          {/* Modal Container: Fixed 780px wide, border-radius 12px, flat #111827 background, 0.5px border */}
+          <div className="bg-[#111827] border border-white/10 rounded-xl max-w-full w-[780px] flex flex-col relative z-35 overflow-hidden">
+            
+            {/* Custom Styles to Hide Scrollbars */}
+            <style>{`
+              .modal-content-scrollbar-hide::-webkit-scrollbar {
+                display: none !important;
+              }
+              .modal-content-scrollbar-hide {
+                -ms-overflow-style: none !important;
+                scrollbar-width: none !important;
+              }
+            `}</style>
+
+            {/* Header */}
+            <div className="flex items-center justify-between p-4 px-6 border-b border-white/10 bg-[#111827]">
+              <div className="flex items-center gap-2">
+                <Sparkles className="w-4 h-4 text-[#d97706]" />
+                <h4 className="text-xs font-bold text-[#e5e7eb] tracking-wider uppercase">
+                  Socrates 系統運算模型核心說明
+                </h4>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowInfoModal(false)}
+                className="p-1 px-2 text-[#9ca3af] hover:text-[#e5e7eb] rounded-[6px] hover:bg-white/5 transition-colors cursor-pointer border border-transparent"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {/* Dialog Tabs - Underline format, active bottom amber line, transparent background */}
+            <div className="flex border-b border-white/10 bg-transparent px-6 py-0 gap-6 overflow-x-auto modal-content-scrollbar-hide">
+              {[
+                { id: "macro", label: "大盤濾網" },
+                { id: "alpha", label: "個股微觀 Alpha 矩陣" },
+                { id: "capital", label: "資金管理與部位映射實務" }
+              ].map((tab) => {
+                const isActive = infoActiveTab === tab.id;
+                return (
+                  <button
+                    key={tab.id}
+                    type="button"
+                    onClick={() => setInfoActiveTab(tab.id as any)}
+                    className={`py-3.5 px-0.5 relative text-xs font-bold transition-all cursor-pointer whitespace-nowrap tracking-wide ${
+                      isActive
+                        ? "text-[#d97706]"
+                        : "text-[#9ca3af] hover:text-[#e5e7eb]"
+                    }`}
+                  >
+                    {tab.label}
+                    {isActive && (
+                      <div className="absolute bottom-0 left-0 right-0 h-[2px] bg-[#d97706]" />
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+
+            {/* Dialog Content - Max height limited to 420px, scrollable, scrollbars hidden, flat */}
+            <div className="p-6 overflow-y-auto flex-1 space-y-6 text-left modal-content-scrollbar-hide max-h-[420px] bg-[#111827] selection:bg-[#d97706]/20">
+              {infoActiveTab === "macro" && (
+                <div className="space-y-6 animate-fade-in text-xs">
+                  
+                  {/* prompt */}
+                  <div className="space-y-3">
+                    <div className="flex items-center gap-2 text-[#d97706] font-bold text-[11px] tracking-[0.07em] uppercase pb-1.5 border-b border-white/10">
+                      <Sparkles className="w-3.5 h-3.5 text-[#d97706]" />
+                      <span>給 AI 的 PROMPT 邏輯</span>
+                    </div>
+                    <p className="text-xs text-[#9ca3af] leading-relaxed pl-1">
+                      引導 AI 扮演全球宏觀分析師，透過多因子分析機制評估明日標普 500 指數的曝險指引。Prompt 核心設計為：
+                    </p>
+                    <ul className="list-disc pl-5 text-xs text-[#9ca3af] space-y-[12px] leading-relaxed">
+                      <li>
+                        <strong className="text-[#e5e7eb]">去泡沫化認證</strong>：要求 AI 啟用具備聯網能力的 Google Search Grounding，實時獲取 TradingView 或華爾街財經源盤後的標普 500 RSI(14) 與 MACD 實體指標，嚴打幻覺。
+                      </li>
+                      <li>
+                        <strong className="text-[#e5e7eb]">精準量化 Schema</strong>：限定必須以原生 JSON 格式回答，將複雜大盤趨勢定性文字，精密鎖定在 JSON 等級的格式中，以供前端系統直接解析與運算。
+                      </li>
+                    </ul>
+                  </div>
+
+                  {/* data analyzed */}
+                  <div className="space-y-3">
+                    <div className="flex items-center gap-2 text-[#d97706] font-bold text-[11px] tracking-[0.07em] uppercase pb-1.5 border-b border-white/10">
+                      <Search className="w-3.5 h-3.5 text-[#d97706]" />
+                      <span>實際分析了哪些相關資料</span>
+                    </div>
+                    <p className="text-xs text-[#9ca3af] leading-relaxed font-semibold pl-1">
+                      本模組主要追蹤與演算大盤系統風險，其核心因子獲取與判斷邏輯如下：
+                    </p>
+
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-3.5 mt-2 pl-1">
+                      <div className="p-3 bg-transparent border border-white/10 rounded-[6px] space-y-1">
+                        <div className="text-[#d97706] font-mono font-bold text-xs">
+                          Beta 基線持倉量 (β)
+                        </div>
+                        <p className="text-[11px] text-[#9ca3af] leading-normal">
+                          <strong className="text-[#e5e7eb]">獲取來源與判定</strong>：基於 S&P 500 長期持倉迴歸估算，系統預設為 <strong className="text-[#d97706] font-mono font-bold">0.806</strong>（可於歷史參數區微調），代表當市場沒有超額預測回報時，防護型核心美股的 Beta 基準配置量。
+                        </p>
+                      </div>
+
+                      <div className="p-3 bg-transparent border border-white/10 rounded-[6px] space-y-1">
+                        <div className="text-[#d97706] font-mono font-bold text-xs">
+                          Alpha 敏感度 (α)
+                        </div>
+                        <p className="text-[11px] text-[#9ca3af] leading-normal">
+                          <strong className="text-[#e5e7eb]">獲取來源與判定</strong>：歷史牛熊多空回測後確定的敏感斜率，系統預設為 <strong className="text-[#d97706] font-mono font-bold">2.5</strong>，決定系統對明日預測超額收益的放大敏感斜率。
+                        </p>
+                      </div>
+
+                      <div className="p-3 bg-transparent border border-white/10 rounded-[6px] space-y-1">
+                        <div className="text-[#d97706] font-mono font-bold text-xs">
+                          明日預測超額收益 (pred_excess)
+                        </div>
+                        <p className="text-[11px] text-[#9ca3af] leading-normal">
+                          <strong className="text-[#e5e7eb]">獲取來源與判定</strong>：系統抓取 RSI(14) 與 MACD 進行動態評級權重加總：
+                          <br />
+                          1. <span className="text-[#e5e7eb] font-semibold">RSI(14)</span> &gt; 70 為過熱（貢獻 <strong className="text-rose-450">-0.30%</strong>），&lt; 30 為超賣（貢獻 <strong className="text-emerald-400 font-bold">+0.30%</strong>），其他為 0%。
+                          <br />
+                          2. <span className="text-[#e5e7eb] font-semibold">MACD</span> &gt; 0 多頭（貢獻 <strong className="text-emerald-400 font-bold">+0.10%</strong>），小於 0 空頭（貢獻 <strong className="text-rose-400">-0.10%</strong>）。
+                        </p>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* how calculation works */}
+                  <div className="space-y-3">
+                    <div className="flex items-center gap-2 text-[#d97706] font-bold text-[11px] tracking-[0.07em] uppercase pb-1.5 border-b border-white/10">
+                      <TrendingUp className="w-3.5 h-3.5 text-[#d97706]" />
+                      <span>怎麼去運算</span>
+                    </div>
+                    <p className="text-xs text-[#9ca3af] leading-relaxed pl-1">
+                      系統獲取動態物理數據後，通過以下二階段精準算式計算：
+                    </p>
+
+                    <div className="p-3 bg-transparent border border-white/10 rounded-[6px] space-y-3 text-xs leading-relaxed font-mono ml-1">
+                      <div>
+                        <span className="text-slate-500">// 1. 計算原始曝險 (Raw Exposure)</span>
+                        <br />
+                        <span className="text-[#e5e7eb]">raw_exposure</span> = <span className="text-[#d97706] font-semibold">beta</span> + (<span className="text-[#d97706] font-semibold">alpha</span> * <span className="text-[#d97706] font-semibold">pred_excess</span>)
+                        <br />
+                        <span className="text-slate-500 text-[11px] font-sans">（例如當 beta=0.806, alpha=2.5, pred_excess=0.278, 算得原始曝險 = 0.806 + (2.5 * 0.278) = 1.501）</span>
+                      </div>
+                      
+                      <div className="border-t border-white/10 pt-2">
+                        <span className="text-slate-500">// 2. 套用安全邊界限制 (np.clip 限制在 0.0 ~ 2.0x 內)</span>
+                        <br />
+                        <span className="text-[#e5e7eb] font-semibold">Exposure Target</span> = <span className="text-[#e5e7eb]">Math.max</span>(0.0, <span className="text-[#e5e7eb]">Math.min</span>(2.0, <span className="text-[#d97706] font-semibold">raw_exposure</span>))
+                      </div>
+                    </div>
+
+                    <p className="text-xs text-[#e5e7eb] mt-3 font-semibold pl-1">
+                      明日預算標普500曝險倍數 (Exposure Target) 數值之判斷與交易決策：
+                    </p>
+                    <div className="space-y-2.5 pl-1">
+                      <div className="text-xs bg-transparent p-3 rounded-[6px] border border-white/10 flex items-start gap-2.5">
+                        <span className="px-2 py-1 rounded-[4px] text-[10px] font-bold bg-rose-500/10 text-rose-400 border border-rose-500/20 font-mono text-center w-16 shrink-0 mt-0.5">
+                          &ge; 1.50x
+                        </span>
+                        <p className="text-[#9ca3af] leading-relaxed">
+                          <strong className="text-[#e5e7eb]">雙倍做多 (極度看漲)</strong>：大盤多頭極度優勢。此時建議加載槓桿，利用標普 550 E-mini 期貨 (ES) 或者是 2倍做多 ETF (SSO) 來補足最後 <strong className="text-[#d97706] font-mono font-bold">1.00x</strong> 階層多頭曝險，大幅拉升資金增長效率。
+                        </p>
+                      </div>
+
+                      <div className="text-xs bg-transparent p-3 rounded-[6px] border border-white/10 flex items-start gap-2.5">
+                        <span className="px-2 py-1 rounded-[4px] text-[10px] font-bold bg-amber-500/10 text-amber-500 border border-amber-500/20 font-mono text-center w-16 shrink-0 mt-0.5">
+                          1.1~1.49x
+                        </span>
+                        <p className="text-[#9ca3af] leading-relaxed">
+                          <strong className="text-[#e5e7eb]">超額曝險多頭</strong>：多頭趨勢上，建議常規正向做多並搭配輕微融資放量，稍微大於 1.0x 基準配置。
+                        </p>
+                      </div>
+
+                      <div className="text-xs bg-transparent p-3 rounded-[6px] border border-white/10 flex items-start gap-2.5">
+                        <span className="px-2 py-1 rounded-[4px] text-[10px] font-bold bg-[#d97706]/10 text-amber-500 border border-[#d97706]/20 font-mono text-center w-16 shrink-0 mt-0.5">
+                          0.8~1.09x
+                        </span>
+                        <p className="text-[#9ca3af] leading-relaxed">
+                          <strong className="text-[#e5e7eb]">基線防守多頭</strong>：大盤平推。建議以標準現貨方式持有 SPY 基準多頭持倉，暫不運用融資衍生品與槓桿。
+                        </p>
+                      </div>
+
+                      <div className="text-xs bg-transparent p-3 rounded-[6px] border border-white/10 flex items-start gap-2.5">
+                        <span className="px-2 py-1 rounded-[4px] text-[10px] font-bold bg-teal-500/10 text-teal-400 border border-teal-500/20 font-mono text-center w-16 shrink-0 mt-0.5">
+                          0.4~0.79x
+                        </span>
+                        <p className="text-[#9ca3af] leading-relaxed">
+                          <strong className="text-[#e5e7eb]">減倉防禦</strong>：短期出現超買回撤警訊，需進行防禦！賣出特定多頭或用標普期貨 (ES) 進行反向空頭套期保值，將曝險降至指定配置比例，餘額保留觀望。
+                        </p>
+                      </div>
+
+                      <div className="text-xs bg-transparent p-3 rounded-[6px] border border-white/10 flex items-start gap-2.5">
+                        <span className="px-2 py-1 rounded-[4px] text-[10px] font-bold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 font-mono text-center w-16 shrink-0 mt-0.5">
+                          &lt; 0.40x
+                        </span>
+                        <p className="text-[#9ca3af] leading-relaxed">
+                          <strong className="text-[#e5e7eb]">極度熊市，全現金防震</strong>：動能崩塌、下行風險加劇。必須售出絕大多數多頭股票，或進行高度對沖（做空對沖比例達到 0.8x+），餘額全部保留現貨，轉入超短期無風險美債（BIL）避震。
+                        </p>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {infoActiveTab === "alpha" && (
+                <div className="space-y-6 animate-fade-in text-xs">
+                  
+                  {/* prompt */}
+                  <div className="space-y-3">
+                    <div className="flex items-center gap-2 text-[#d97706] font-bold text-[11px] tracking-[0.07em] uppercase pb-1.5 border-b border-white/10">
+                      <Sparkles className="w-3.5 h-3.5 text-[#d97706]" />
+                      <span>給 AI 的 PROMPT 邏輯</span>
+                    </div>
+                    <p className="text-xs text-[#9ca3af] leading-relaxed pl-1">
+                      指示 AI 做為「精量基本面與情緒語意探勘專家」對個股進行精緻、定性定量結合的「微觀 Alpha 矩陣」評級。其核心 Prompt 架構如下：
+                    </p>
+                    <ul className="list-disc pl-5 text-xs text-[#9ca3af] space-y-[12px] leading-relaxed">
+                      <li>
+                        <strong className="text-[#e5e7eb]">時效檢證</strong>：要求 AI 啟用具備時效認證的 Google Search Grounding，實施聯網，抓取 1-3 個月內發表的最新季報、分析師評級、SEC Form 4 內部人買賣申報、以及法說會文字稿。
+                      </li>
+                      <li>
+                        <strong className="text-[#e5e7eb]">定定量轉換評分卡</strong>：指示 AI 對 9 大核心指標進行 0.00 至 10.00 的歸一化評分轉換，並給予 1 句純數據支撐、無妄加揣測的流暢中文論證。
+                      </li>
+                    </ul>
+                  </div>
+
+                  {/* data analyzed */}
+                  <div className="space-y-3">
+                    <div className="flex items-center gap-2 text-[#d97706] font-bold text-[11px] tracking-[0.07em] uppercase pb-1.5 border-b border-white/10">
+                      <Search className="w-3.5 h-3.5 text-[#d97706]" />
+                      <span>實際分析了哪些相關資料</span>
+                    </div>
+                    <p className="text-xs text-[#9ca3af] leading-relaxed font-semibold pl-1 font-sans">
+                      個股 Alpha 矩陣背後調用並審查的三大範疇與九個底層變數：
+                    </p>
+
+                    <div className="space-y-3 text-xs leading-normal pl-1">
+                      <div className="p-3 bg-transparent border border-white/10 rounded-[6px]">
+                        <span className="font-bold text-[#e5e7eb] font-sans text-xs">一、個股基本面因子 (Individual Fundamentals)</span>
+                        <div className="grid grid-cols-1 md:grid-cols-3 gap-2.5 mt-2 text-[#9ca3af] text-[11px] leading-relaxed">
+                          <div>• <strong className="text-[#e5e7eb]">季報營業利益率年增率</strong>：驗證當季主營利潤率是否真正擴張，排除一次性營業外利益虛增。</div>
+                          <div>• <strong className="text-[#e5e7eb]">自由現金流殖利率</strong>：確保主營利潤由真實現金流支撐，提高持倉安全係數。</div>
+                          <div>• <strong className="text-[#e5e7eb]">PEG 估值分位數</strong>：動態評估估值性價比（本益比/成長率），避免高成長神話泡沫。</div>
+                        </div>
+                      </div>
+
+                      <div className="p-3 bg-transparent border border-white/10 rounded-[6px]">
+                        <span className="font-bold text-[#e5e7eb] font-sans text-xs">二、籌碼與情緒因子 (Individual Sentiment)</span>
+                        <div className="grid grid-cols-1 md:grid-cols-3 gap-2.5 mt-2 text-[#9ca3af] text-[11px] leading-relaxed">
+                          <div>• <strong className="text-[#e5e7eb]">內部人過去一個月淨活動</strong>：拆解高層親自買賣股權的 Form 4 SEC 公告，看透大股東持股底牌。</div>
+                          <div>• <strong className="text-[#e5e7eb]">分析師遠期 EPS 預估上修比例</strong>：量化華爾街對公司盈餘上修的積極共識，為資金定價提供追捧動能。</div>
+                          <div>• <strong className="text-[#e5e7eb]">法說會 NLP 文字情感分析</strong>：利用 NLP 文字探勘深度計算財報會議上管理層、法人語調之樂觀度與風險警示文字。</div>
+                        </div>
+                      </div>
+
+                      <div className="p-3 bg-transparent border border-white/10 rounded-[6px]">
+                        <span className="font-bold text-[#e5e7eb] font-sans text-xs">三、技術與動能因子 (Individual Dynamics)</span>
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5 mt-2 text-[#9ca3af] text-[11px] leading-relaxed">
+                          <div>• <strong className="text-[#e5e7eb]">60日相對強弱度 (RS)</strong>：個股相對於 S&P 500 大盤累積 60D 的超額相對強度 (RS)，數值大於 70 代表技術面強大優勢。</div>
+                          <div>• <strong className="text-[#e5e7eb]">站上200MA及ATR波動收斂</strong>：多頭軌跡確認（200MA 之上）與波動度壓縮（ATR Coiled 機制），代表底部蓄勢正完畢。</div>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* how calculation works */}
+                  <div className="space-y-3">
+                    <div className="flex items-center gap-2 text-[#d97706] font-bold text-[11px] tracking-[0.07em] uppercase pb-1.5 border-b border-white/10">
+                      <TrendingUp className="w-3.5 h-3.5 text-[#d97706]" />
+                      <span>怎麼去運算</span>
+                    </div>
+                    <p className="text-xs text-[#9ca3af] leading-relaxed pl-1 font-sans">
+                      個股量化模組的融合運算，主要包含以下三個核心步驟：
+                    </p>
+                    <ol className="list-decimal pl-5 text-xs text-[#9ca3af] space-y-[12px] leading-relaxed">
+                      <li>
+                        <strong className="text-[#e5e7eb]">即時數據爬梳 (Grounding Sync)</strong>：調用 Gemini 目錄配合聯網獲致上述 3 面的實際財務、申報數據、指標物理值。
+                      </li>
+                      <li>
+                        <strong className="text-[#e5e7eb]">跨同業百分位歸一 (Normalization)</strong>：將各物理指標在同行業及歷史群組中百分分位數（Percentile）折算為 0.00 至 10.00 分的無尺度量化指標。
+                      </li>
+                      <li>
+                        <strong className="text-[#e5e7eb]">聚合多因子總評等 (Total Score)</strong>：加權合成出最終評等 <code className="text-[#d97706] font-mono font-bold bg-white/5 px-1 rounded border border-white/10">totalStockScore</code>（由五星或色輪指標展示），大幅節省手動過濾財報與籌碼分析之巨量工時。
+                      </li>
+                    </ol>
+                  </div>
+                </div>
+              )}
+
+              {infoActiveTab === "capital" && (
+                <div className="space-y-6 animate-fade-in text-xs">
+                  
+                  {/* prompt */}
+                  <div className="space-y-3">
+                    <div className="flex items-center gap-2 text-[#d97706] font-bold text-[11px] tracking-[0.07em] uppercase pb-1.5 border-b border-white/10">
+                      <Sparkles className="w-3.5 h-3.5 text-[#d97706]" />
+                      <span>給 AI 的 PROMPT 邏輯</span>
+                    </div>
+                    <p className="text-xs text-[#9ca3af] leading-relaxed pl-1">
+                      引導 AI 扮演「Socrates 資金管理與部位映射風控顧問」，全方位監防持倉板塊與大盤槓桿購買力：
+                    </p>
+                    <ul className="list-disc pl-5 text-xs text-[#9ca3af] space-y-[12px] leading-relaxed">
+                      <li>
+                        <strong className="text-[#e5e7eb]">實存部位穿透</strong>：傳入帳戶實際持倉，穿透其持有的個股代碼、累計規模（Shares）、當前成本均價、交易多空方向（Buy/Short）與交易帳戶模式，在 AI 面板上為每檔股票計算相應調整策略。
+                      </li>
+                      <li>
+                        <strong className="text-[#e5e7eb]">限定反饋輸出限制</strong>：強制判定行為僅限：Increase (加碼)、Decrease (減碼)、Hold (不變) 之一。其推薦變動股數 (sharesChange) 表達精確相對值，且任何減倉股數皆受多頭總倉位限制。
+                      </li>
+                    </ul>
+                  </div>
+
+                  {/* data analyzed */}
+                  <div className="space-y-3">
+                    <div className="flex items-center gap-2 text-[#d97706] font-bold text-[11px] tracking-[0.07em] uppercase pb-1.5 border-b border-white/10">
+                      <Search className="w-3.5 h-3.5 text-[#d97706]" />
+                      <span>實際分析了哪些相關資料</span>
+                    </div>
+                    <p className="text-xs text-[#9ca3af] leading-relaxed pl-1">
+                      本配置區可實現槓桿監防，全面串接與審查以下多因子實務：
+                    </p>
+                    <ul className="list-disc pl-5 text-xs text-[#9ca3af] space-y-[12px] leading-relaxed">
+                      <li>
+                        <strong className="text-[#e5e7eb]">真實 vs 模擬部位總市值</strong>：自動匹配美股即時估值與庫存，即時計算最新總市值，展現絕對權重。
+                      </li>
+                      <li>
+                        <strong className="text-[#e5e7eb]">板塊資金密度 (Sector Map)</strong>：自動抓取 TradingView 行業界定，將股票代號分配對應板塊（科技、公用、金融、能源等），評量是否有行業集中風險。
+                      </li>
+                      <li>
+                        <strong className="text-[#e5e7eb]">槓桿及融資購買力</strong>：串聯用戶手動微調的「帳戶總資產」與「Moomoo 融資槓桿倍數」（預設 2.0x 槓桿），依此對投資安全墊、保證金維持風險實行多重限額監防。
+                      </li>
+                    </ul>
+                  </div>
+
+                  {/* how calculation works */}
+                  <div className="space-y-3">
+                    <div className="flex items-center gap-2 text-[#d97706] font-bold text-[11px] tracking-[0.07em] uppercase pb-1.5 border-b border-white/10">
+                      <TrendingUp className="w-3.5 h-3.5 text-[#d97706]" />
+                      <span>怎麼去運算</span>
+                    </div>
+                    <p className="text-xs text-[#9ca3af] leading-relaxed pl-1 font-sans">
+                      系統為保障運算高韌性，採用「AI量化」與「定性本地計量」雙軌運作：
+                    </p>
+
+                    <div className="space-y-3 text-xs leading-normal pl-1">
+                      <div className="p-3 bg-transparent border border-white/10 rounded-[6px] space-y-1.5">
+                        <span className="font-bold text-[#d97706] font-sans text-xs"> 第一軌：Gemini AI 全域優化映射 (連線模式)</span>
+                        <p className="text-[#9ca3af] leading-relaxed">
+                          AI 基於宏觀機構熱錢流，利用動態多因子優化算法（多空與板塊輪動係數），產生出最佳優化配置與增減股數異動 `sharesChange`，大幅節省人工風險調整工時。
+                        </p>
+                      </div>
+
+                      <div className="p-3 bg-transparent border border-white/10 rounded-[6px] space-y-1.5">
+                        <span className="font-bold text-[#d97706] font-sans text-xs"> 第二軌：Socrates 本地計量防禦模型 (本地備存定性)</span>
+                        <p className="text-[#9ca3af] leading-relaxed">
+                          當網路受阻或 API 被限流時，無縫由本地 Socrates 規則庫核心算式接手分析，對持倉股份進行板塊對症定性優化：
+                        </p>
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-2 mt-1.5 text-[11px] text-[#9ca3af] pl-2 leading-relaxed">
+                          <div>• <strong className="text-[#e5e7eb]">科技半導體</strong>：主力熱錢淨流入（特別如 NVDA、AAPL、MSFT、AMD），映射為 <span className="text-emerald-450 font-bold">Increase (加碼持位 +15%)</span>.</div>
+                          <div>• <strong className="text-[#e5e7eb]">金融權重股</strong>：淨自利息利潤與融資彈性，映射為 <span className="text-emerald-450 font-bold">Increase (加碼持位 +8%)</span>.</div>
+                          <div>• <strong className="text-[#e5e7eb]">防禦與民生公用</strong>：避險價值走穩但動能趨平，映射為 <span className="text-slate-300">Hold (不變其基準持倉)</span>.</div>
+                          <div>• <strong className="text-[#e5e7eb]">能源與大宗商品</strong>：受名目利率滯後壓制，流向有退潮跡象，映射為 <span className="text-[#d97706]">Decrease (戰術性減持 -12% 股數)</span>.</div>
+                          <div>• <strong className="text-[#d97706] font-medium">融券避險(Short)標對</strong>：如遇個股在板塊底部企穩軋空，映射為 <span className="text-[#d97706]">Decrease (逢低適量減空 -10% 以防回撤)</span>.</div>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Footer with Top Border, Flexbox, Page Indicator and CTA Button */}
+            <div className="p-4 px-6 border-t border-white/10 bg-[#111827] flex items-center justify-between">
+              
+              {/* Left Side: Page indicator with dot active states */}
+              <div className="flex items-center gap-3 select-none">
+                <div className="flex gap-1.5">
+                  {["macro", "alpha", "capital"].map((tabId) => {
+                    const isActive = infoActiveTab === tabId;
+                    return (
+                      <button
+                        key={tabId}
+                        type="button"
+                        onClick={() => setInfoActiveTab(tabId as any)}
+                        className={`w-1.5 h-1.5 rounded-full transition-colors cursor-pointer border-0 p-0 ${
+                          isActive ? "bg-[#d97706]" : "bg-white/20 hover:bg-white/40"
+                        }`}
+                        title={`切換至 ${tabId === "macro" ? "大盤濾網" : tabId === "alpha" ? "個股微觀 Alpha 矩陣" : "資金管理與部位映射實務"}`}
+                      />
+                    );
+                  })}
+                </div>
+                <span className="text-[11px] font-bold text-[#9ca3af] tracking-[0.05em] font-mono">
+                  第 {infoActiveTab === "macro" ? "1" : infoActiveTab === "alpha" ? "2" : "3"} 頁，共 3 頁
+                </span>
+              </div>
+
+              {/* Right Side: Flat CTA closes modal. Radius exactly 6px */}
+              <button
+                type="button"
+                onClick={() => setShowInfoModal(false)}
+                className="px-5 py-2 bg-[#d97706] hover:bg-amber-700 active:bg-amber-800 text-white font-bold rounded-[6px] text-xs tracking-wider cursor-pointer transition-colors border-0 select-none shadow-none"
+              >
+                理解並返回工作區
               </button>
             </div>
           </div>
