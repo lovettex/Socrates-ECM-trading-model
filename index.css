@@ -1,0 +1,3 @@
+/* Placeholder stylesheet — the app relies on Tailwind CDN + inline styles.
+   This file exists so the <link rel="stylesheet" href="/index.css"> in
+   index.html does not 404. Add custom CSS here if needed. */

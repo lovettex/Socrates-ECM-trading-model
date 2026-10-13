@@ -116,6 +116,23 @@
 <link rel="stylesheet" href="/index.css">
 </head>
 <body>
+  <div id="llm-provider-switcher" style="position:fixed;top:10px;right:10px;z-index:9999;display:flex;align-items:center;gap:6px;background:rgba(30,41,59,.92);border:1px solid rgba(148,163,184,.35);border-radius:8px;padding:6px 10px;font-family:'JetBrains Mono',monospace;font-size:12px;color:#e2e8f0;box-shadow:0 4px 12px rgba(0,0,0,.3);">
+    <span style="opacity:.65;">LLM</span>
+    <select id="llm-provider-select" style="background:#0f172a;color:#e2e8f0;border:1px solid rgba(148,163,184,.4);border-radius:6px;padding:3px 6px;font-size:12px;outline:none;cursor:pointer;">
+      <option value="gemini">Gemini</option>
+      <option value="deepseek">DeepSeek</option>
+    </select>
+  </div>
+  <script>
+    (function () {
+      var sel = document.getElementById("llm-provider-select");
+      var key = "ecm_llm_provider";
+      try { sel.value = localStorage.getItem(key) || "gemini"; } catch (e) {}
+      sel.addEventListener("change", function () {
+        try { localStorage.setItem(key, sel.value); } catch (e) {}
+      });
+    })();
+  </script>
   <div id="root"></div>
 </body>
 </html>

@@ -2,6 +2,7 @@ import React, { useState, useEffect, useMemo } from "react";
 
 // --- GoogleGenAI Server Proxy Class ---
 import { getQuotaErrorMessage } from "./utils";
+import { getActiveProvider } from "./llmProvider";
 
 export enum Type {
   STRING = "STRING",
@@ -22,7 +23,7 @@ class GoogleGenAI {
           headers: {
             "Content-Type": "application/json",
           },
-          body: JSON.stringify(params),
+          body: JSON.stringify({ ...params, provider: getActiveProvider() }),
         });
         if (!response.ok) {
           const errMsg = await response.text();

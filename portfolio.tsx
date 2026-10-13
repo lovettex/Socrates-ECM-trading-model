@@ -20,6 +20,7 @@ import {
   HelpCircle,
 } from "lucide-react";
 import * as gdrive from "./googleDrive";
+import { getActiveProvider } from "./llmProvider";
 
 // --- GoogleGenAI Server Proxy Class ---
 class GoogleGenAI {
@@ -31,7 +32,7 @@ class GoogleGenAI {
           headers: {
             "Content-Type": "application/json",
           },
-          body: JSON.stringify(params),
+          body: JSON.stringify({ ...params, provider: getActiveProvider() }),
         });
         if (!response.ok) {
           const errMsg = await response.text();

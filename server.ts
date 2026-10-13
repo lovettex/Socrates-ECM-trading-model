@@ -2,6 +2,36 @@ import express from "express";
 import path from "path";
 import { GoogleGenAI } from "@google/genai";
 
+const DEEPSEEK_BASE_URL = process.env.DEEPSEEK_BASE_URL || "https://api.deepseek.com";
+const JEV_BASE_URL = process.env.JEV_BASE_URL || "https://gateway.ngrok.ai/v1";
+
+// Convert Gemini `contents` (string | {role, parts[]}[]) into OpenAI chat `messages`
+function contentsToMessages(contents: any): { role: string; content: string }[] {
+  if (typeof contents === "string") {
+    return [{ role: "user", content: contents }];
+  }
+  if (Array.isArray(contents)) {
+    return contents.map((item: any) => {
+      if (typeof item === "string") return { role: "user", content: item };
+      let text = "";
+      if (item && Array.isArray(item.parts)) {
+        text = item.parts
+          .map((p: any) => (typeof p === "string" ? p : p?.text || ""))
+          .join("\n");
+      } else if (item && item.text) {
+        text = item.text;
+      } else {
+        text = JSON.stringify(item);
+      }
+      return { role: item?.role || "user", content: text };
+    });
+  }
+  if (contents && typeof contents === "object") {
+    return [{ role: "user", content: JSON.stringify(contents) }];
+  }
+  return [{ role: "user", content: String(contents) }];
+}
+
 async function startServer() {
   const app = express();
   const PORT = 3000;
@@ -11,12 +41,14 @@ async function startServer() {
   // API endpoint for secure backend Gemini content generation (lazily initializes GoogleGenAI)
   app.post("/api/gemini/generate", async (req, res) => {
     try {
-      const { model, contents, config } = req.body;
+      const { model, contents, config, provider } = req.body;
       if (!model || !contents) {
         return res.status(400).json({ error: "Missing model or contents in request body" });
       }
 
       const apiKey = process.env.GEMINI_API_KEY;
+      const deepseekApiKey = process.env.DEEPSEEK_API_KEY;
+      const providerName = (provider || "gemini").toLowerCase();
 
       // Helper to generate simulation if raw key is missing or quota/rate limit is exhausted
       const generateSimulatedResponse = (textContents: any) => {
@@ -281,6 +313,52 @@ async function startServer() {
         }, null, 2);
       };
 
+      // --- DeepSeek provider (OpenAI-compatible chat) ---
+      if (providerName === "deepseek") {
+        if (!deepseekApiKey) {
+          console.warn("[DeepSeek API Key Missing] Active high-fidelity local matrix simulation...");
+          return res.json({
+            text: generateSimulatedResponse(contents),
+            candidates: []
+          });
+        }
+        try {
+          const dsModel =
+            typeof model === "string" && model.toLowerCase().startsWith("deepseek")
+              ? model
+              : "deepseek-chat";
+          const dsRes = await fetch(`${DEEPSEEK_BASE_URL}/chat/completions`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "Authorization": `Bearer ${deepseekApiKey}`,
+            },
+            body: JSON.stringify({
+              model: dsModel,
+              messages: contentsToMessages(contents),
+              temperature: 0.7,
+            }),
+          });
+          if (!dsRes.ok) {
+            const errText = await dsRes.text();
+            console.error("[DeepSeek Error]", dsRes.status, errText);
+            return res.json({
+              text: generateSimulatedResponse(contents),
+              candidates: []
+            });
+          }
+          const dsData: any = await dsRes.json();
+          const text = dsData?.choices?.[0]?.message?.content || "";
+          return res.json({ text, candidates: [] });
+        } catch (e: any) {
+          console.error("[DeepSeek Fatal] Falling back to simulation. Error:", e);
+          return res.json({
+            text: generateSimulatedResponse(contents),
+            candidates: []
+          });
+        }
+      }
+
       if (!apiKey) {
         // Return simulated backup directly if key is empty
         console.warn("[Gemini API Key Missing] Active high-fidelity local matrix simulation...");
@@ -365,6 +443,49 @@ async function startServer() {
         res.status(500).json({ error: error?.message || String(error) });
       }
     }
+  });
+
+  // Jev by Typesafe AI — System One decision model (state + typed questions -> probabilities)
+  app.post("/api/jev/decide", async (req, res) => {
+    try {
+      const { model, state, questions } = req.body;
+      const jevApiKey = process.env.JEV_API_KEY;
+      if (!jevApiKey) {
+        return res.status(400).json({ error: "JEV_API_KEY is not configured in .env.local" });
+      }
+      if (state === undefined || !questions) {
+        return res.status(400).json({ error: "Missing state or questions in request body" });
+      }
+      const jevRes = await fetch(`${JEV_BASE_URL}/systemone`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${jevApiKey}`,
+        },
+        body: JSON.stringify({
+          model: model || "jev-latest",
+          state,
+          questions,
+        }),
+      });
+      if (!jevRes.ok) {
+        const errText = await jevRes.text();
+        return res.status(jevRes.status).json({ error: errText });
+      }
+      const data = await jevRes.json();
+      return res.json(data);
+    } catch (error: any) {
+      res.status(500).json({ error: error?.message || String(error) });
+    }
+  });
+
+  // Reports which LLM providers have keys configured (frontend dropdown uses this)
+  app.get("/api/llm/status", (_req, res) => {
+    res.json({
+      gemini: Boolean(process.env.GEMINI_API_KEY),
+      deepseek: Boolean(process.env.DEEPSEEK_API_KEY),
+      jev: Boolean(process.env.JEV_API_KEY),
+    });
   });
 
   // Vite middleware for development vs static asset serving for production

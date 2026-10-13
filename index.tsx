@@ -7,6 +7,7 @@ import React, {
 } from "react";
 import { createRoot } from "react-dom/client";
 import { Type } from "@google/genai";
+import { getActiveProvider } from "./llmProvider";
 
 // Polyfill process.env for client-side to prevent ReferenceError crashes when process.env.GEMINI_API_KEY is referenced
 if (typeof window !== "undefined" && !(window as any).process) {
@@ -23,7 +24,7 @@ class GoogleGenAI {
           headers: {
             "Content-Type": "application/json",
           },
-          body: JSON.stringify(params),
+          body: JSON.stringify({ ...params, provider: getActiveProvider() }),
         });
         if (!response.ok) {
           const errMsg = await response.text();
